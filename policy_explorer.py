@@ -34,7 +34,6 @@ from ha_policy_surrogate import (
 )
 from ha_policy_visualization import (
     complete_derived_state,
-    link_labor_income_state,
     load_exact_grid_slice,
     make_policy_surface,
 )
@@ -207,153 +206,6 @@ def _out_of_sample_model_summary(
     return summary
 
 
-def _catalog_values_equal(
-    series: pd.Series,
-    value: Any,
-) -> np.ndarray:
-    numeric = pd.to_numeric(series, errors="coerce")
-
-    try:
-        numeric_value = float(value)
-        value_is_numeric = np.isfinite(numeric_value)
-    except (TypeError, ValueError):
-        value_is_numeric = False
-
-    if value_is_numeric and numeric.notna().any():
-        return np.isclose(
-            numeric.to_numpy(dtype=float),
-            numeric_value,
-            rtol=1.0e-10,
-            atol=1.0e-12,
-            equal_nan=False,
-        )
-
-    return series.astype(str).to_numpy() == str(value)
-
-
-def _filter_catalog(
-    catalog: pd.DataFrame,
-    selections: dict[str, Any],
-) -> pd.DataFrame:
-    mask = np.ones(len(catalog), dtype=bool)
-
-    for column, value in selections.items():
-        if column not in catalog:
-            continue
-        mask &= _catalog_values_equal(
-            catalog[column],
-            value,
-        )
-
-    return catalog.loc[mask].copy()
-
-
-def _sorted_catalog_values(
-    series: pd.Series,
-) -> list[Any]:
-    values = series.dropna().unique().tolist()
-
-    if not values:
-        return []
-
-    numeric = pd.to_numeric(
-        pd.Series(values),
-        errors="coerce",
-    )
-
-    if numeric.notna().all():
-        return [float(value) for value in sorted(numeric.tolist())]
-
-    return sorted([str(value) for value in values])
-
-
-def _contains_catalog_value(
-    values: list[Any],
-    candidate: Any,
-) -> bool:
-    if not values:
-        return False
-
-    return bool(
-        _catalog_values_equal(
-            pd.Series(values),
-            candidate,
-        ).any()
-    )
-
-
-def _initial_catalog_value(
-    bundle: PolicySurrogateBundle,
-    column: str,
-    available: list[Any],
-) -> Any:
-    if not available:
-        raise ValueError(f"No available values for {column}.")
-
-    default = bundle.default_values.get(column)
-
-    if default is not None and _contains_catalog_value(
-        available,
-        default,
-    ):
-        for value in available:
-            if _contains_catalog_value([value], default):
-                return value
-
-    try:
-        default_numeric = float(default)
-        numeric = np.asarray(available, dtype=float)
-        return available[int(np.argmin(np.abs(numeric - default_numeric)))]
-    except (TypeError, ValueError):
-        return available[0]
-
-
-def _parameter_button_order(
-    bundle: PolicySurrogateBundle,
-    catalog: pd.DataFrame,
-) -> list[str]:
-    candidates = [
-        column
-        for column in (
-            list(bundle.feature_spec.parameter_columns)
-            + list(bundle.feature_spec.categorical_parameter_columns)
-        )
-        if (
-            column in catalog
-            and not column.endswith("__missing")
-            and catalog[column].nunique(dropna=True) > 1
-        )
-    ]
-
-    preferred = [
-        "param__config__discount_factor",
-        "param__config__risk_aversion",
-        "param__config__allow_borrowing",
-        "param__config__borrowing_limit",
-        "param__config__liquid_interest_rate",
-        "param__config__illiquid_interest_rate",
-        "param__config__borrowing_interest_rate",
-        "param__config__ct_linear_adjustment_cost",
-        "param__config__ct_convex_adjustment_cost",
-        "param__config__ct_automatic_illiquid_income_share",
-        "param__policy__income__persistence",
-        "param__policy__income__innovation_std",
-        "param__policy__employment__job_loss_probability",
-        "param__policy__employment__job_finding_probability",
-        "param__policy__employment__unemployment_replacement_rate",
-        "param__policy__tax__kind",
-        "param__policy__tax__flat_rate",
-        "param__policy__tax__progressive_rate",
-        "param__policy__pension__replacement_rate",
-    ]
-
-    ordered = [column for column in preferred if column in candidates]
-
-    ordered.extend(sorted(column for column in candidates if column not in ordered))
-
-    return ordered
-
-
 def _button_label(value: Any) -> str:
     try:
         number = float(value)
@@ -365,96 +217,31 @@ def _button_label(value: Any) -> str:
     return str(value)
 
 
-def _parameter_button_selector(
-    bundle: PolicySurrogateBundle,
-    catalog: pd.DataFrame,
-    *,
-    bundle_path: str,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Sequential parameter selector with unavailable choices disabled."""
+def _display_value(value: Any) -> str:
+    """Convert mixed scalar metadata to a stable Arrow-compatible string."""
 
-    columns = _parameter_button_order(
-        bundle,
-        catalog,
-    )
+    if value is None or value is pd.NA:
+        return ""
 
-    selector_identity = str(Path(bundle_path).expanduser().resolve())
-    identity_key = "exact_selector_bundle_identity"
-    selection_key = "exact_parameter_selection"
+    if isinstance(value, np.generic):
+        value = value.item()
 
-    if st.session_state.get(identity_key) != selector_identity:
-        st.session_state[identity_key] = selector_identity
-        st.session_state[selection_key] = {}
+    if isinstance(value, float) and np.isnan(value):
+        return ""
 
-    selections = dict(st.session_state.get(selection_key, {}))
-    prior_selections: dict[str, Any] = {}
+    return _button_label(value)
 
-    for index, column in enumerate(columns):
-        eligible = _filter_catalog(
-            catalog,
-            prior_selections,
-        )
 
-        all_values = _sorted_catalog_values(catalog[column])
-        available_values = _sorted_catalog_values(eligible[column])
+def _arrow_safe_display(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert object/category columns to consistent strings for Streamlit."""
 
-        current = selections.get(column)
-        if current is None or not _contains_catalog_value(
-            available_values,
-            current,
+    out = frame.copy()
+    for column in out.columns:
+        if pd.api.types.is_object_dtype(out[column].dtype) or isinstance(
+            out[column].dtype, pd.CategoricalDtype
         ):
-            current = _initial_catalog_value(
-                bundle,
-                column,
-                available_values,
-            )
-            selections[column] = current
-
-        st.markdown(f"**{_pretty(column)}**")
-
-        for start in range(0, len(all_values), 6):
-            chunk = all_values[start : start + 6]
-            button_columns = st.columns(len(chunk))
-
-            for position, value in enumerate(chunk):
-                available = _contains_catalog_value(
-                    available_values,
-                    value,
-                )
-                selected = _contains_catalog_value(
-                    [current],
-                    value,
-                )
-
-                with button_columns[position]:
-                    clicked = st.button(
-                        _button_label(value),
-                        key=(f"exact_param_button__" f"{index}__{start + position}"),
-                        disabled=not available,
-                        type="primary" if selected else "secondary",
-                        use_container_width=True,
-                    )
-
-                if clicked:
-                    selections[column] = value
-
-                    # Later parameter choices are conditional on this one.
-                    for later_column in columns[index + 1 :]:
-                        selections.pop(later_column, None)
-
-                    st.session_state[selection_key] = selections
-                    st.rerun()
-
-        prior_selections[column] = current
-
-    st.session_state[selection_key] = selections
-
-    matches = _filter_catalog(
-        catalog,
-        prior_selections,
-    )
-
-    return matches, prior_selections
+            out[column] = out[column].map(_display_value).astype("string")
+    return out
 
 
 def _default_output_range(
@@ -503,35 +290,48 @@ def _default_output_range(
     return lo - padding, hi + padding
 
 
+def _reset_output_axis(
+    range_key: str,
+    min_widget_key: str,
+    max_widget_key: str,
+    default_range: tuple[float, float],
+) -> None:
+    """Reset a persistent output scale before Streamlit reruns the script."""
+
+    lo, hi = map(float, default_range)
+    st.session_state[range_key] = (lo, hi)
+    st.session_state[min_widget_key] = lo
+    st.session_state[max_widget_key] = hi
+
+
 def _output_axis_control(
     bundle: PolicySurrogateBundle,
     sample: pd.DataFrame,
     output: str,
     *,
     context: str,
+    button_label: str = "Change y-axis",
+    axis_description: str = "y-axis",
 ) -> tuple[float, float]:
-    """Persistent axis limits that do not change when other controls move."""
+    """Persistent output limits that do not move when parameters change."""
 
     default_range = _default_output_range(bundle, sample, output)
 
     range_key = f"{context}__fixed_output_range__{output}"
-    min_widget_key = f"{context}__ymin__{output}"
-    max_widget_key = f"{context}__ymax__{output}"
+    min_widget_key = f"{context}__axis_min__{output}"
+    max_widget_key = f"{context}__axis_max__{output}"
 
     if range_key not in st.session_state:
-        st.session_state[range_key] = default_range
+        st.session_state[range_key] = tuple(map(float, default_range))
 
     current_lo, current_hi = st.session_state[range_key]
+    st.session_state.setdefault(min_widget_key, float(current_lo))
+    st.session_state.setdefault(max_widget_key, float(current_hi))
 
-    if min_widget_key not in st.session_state:
-        st.session_state[min_widget_key] = float(current_lo)
-    if max_widget_key not in st.session_state:
-        st.session_state[max_widget_key] = float(current_hi)
-
-    with st.popover("Change y-axis"):
+    with st.popover(button_label):
         st.caption(
-            "These limits remain fixed when household states or model "
-            "parameters change."
+            f"The {axis_description} remains fixed when household states or "
+            "model parameters change."
         )
 
         lo = st.number_input(
@@ -550,17 +350,20 @@ def _output_axis_control(
         else:
             st.session_state[range_key] = (float(lo), float(hi))
 
-        if st.button(
+        st.button(
             "Reset to data range",
-            key=f"{context}__reset_y__{output}",
-            use_container_width=True,
-        ):
-            st.session_state[range_key] = default_range
-            st.session_state[min_widget_key] = float(default_range[0])
-            st.session_state[max_widget_key] = float(default_range[1])
-            st.rerun()
+            key=f"{context}__reset_axis__{output}",
+            # width="stretch",
+            on_click=_reset_output_axis,
+            args=(
+                range_key,
+                min_widget_key,
+                max_widget_key,
+                default_range,
+            ),
+        )
 
-    return tuple(st.session_state[range_key])
+    return tuple(map(float, st.session_state[range_key]))
 
 
 def _continuous_plot_columns(
@@ -959,11 +762,6 @@ def _one_dimensional_page(
         )
 
     x_range = _range_selector(bundle, x, "one_d_x_range")
-    linked_columns = [
-        col
-        for col in ("labor_income_state",)
-        if col in bundle.feature_spec.state_columns
-    ]
 
     linked_label = (
         "Move labor income state proportionally with current income"
@@ -973,6 +771,7 @@ def _one_dimensional_page(
 
     linked_income_requested = st.checkbox(
         linked_label,
+        value=bool(linked_columns),
         disabled=(x != "current_income" or not linked_columns),
         key="one_d_linked_income",
     )
@@ -1029,58 +828,70 @@ def _one_dimensional_page(
         linked_income=linked_income,
         y_range=y_range,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     with st.expander("Fixed values used in this slice"):
         display = pd.DataFrame(
-            {"variable": list(base), "value": [base[k] for k in base]}
+            {
+                "variable": list(base),
+                "value": [base[key] for key in base],
+            }
         )
-        st.dataframe(display, hide_index=True, use_container_width=True)
+        st.dataframe(
+            _arrow_safe_display(display),
+            hide_index=True,
+            width="stretch",
+        )
 
 
 def _surface_page(
-    bundle: PolicySurrogateBundle, base: dict[str, Any], *, bundle_path: str | Path
+    bundle: PolicySurrogateBundle,
+    base: dict[str, Any],
+    *,
+    bundle_path: str | Path,
 ) -> None:
-    continuous = list(bundle.feature_spec.state_columns) + [
-        c for c in bundle.feature_spec.parameter_columns if not c.endswith("__missing")
-    ]
-    continuous = [
-        c
-        for c in continuous
-        if c in bundle.feature_ranges
-        and c
-        not in {
-            "after_tax_income",
-            "total_assets",
-            "cash_on_hand",
-            "years_to_retirement",
-        }
-    ]
-    c1, c2, c3 = st.columns(3)
+    """Plot a two-dimensional state/parameter surface as a heatmap."""
+
+    continuous = _continuous_plot_columns(bundle)
+    if len(continuous) < 2:
+        st.info("At least two continuous variables are required for a surface.")
+        return
+
+    sample = _load_training_sample(str(bundle_path))
+
+    default_x = "current_income" if "current_income" in continuous else continuous[0]
+    current_x = st.session_state.get("surface_x", default_x)
+    if current_x not in continuous:
+        st.session_state.pop("surface_x", None)
+        current_x = default_x
+
+    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.15, 0.85])
+
     with c1:
         x = st.selectbox(
             "Horizontal axis",
             continuous,
-            index=(
-                continuous.index("current_income")
-                if "current_income" in continuous
-                else 0
-            ),
+            index=continuous.index(current_x),
             format_func=_pretty,
             key="surface_x",
         )
-    y_options = [c for c in continuous if c != x]
+
+    y_options = [column for column in continuous if column != x]
+    default_y = "liquid_assets" if "liquid_assets" in y_options else y_options[0]
+    current_y = st.session_state.get("surface_y", default_y)
+    if current_y not in y_options:
+        st.session_state.pop("surface_y", None)
+        current_y = default_y
+
     with c2:
-        y_default = (
-            y_options.index("liquid_assets") if "liquid_assets" in y_options else 0
-        )
         y = st.selectbox(
             "Vertical axis",
             y_options,
-            index=y_default,
+            index=y_options.index(current_y),
             format_func=_pretty,
             key="surface_y",
         )
+
     with c3:
         output = st.selectbox(
             "Policy choice",
@@ -1089,19 +900,36 @@ def _surface_page(
             key="surface_output",
         )
 
+    with c4:
+        outcome_range = _output_axis_control(
+            bundle,
+            sample,
+            output,
+            context="two_dimensional",
+            button_label="Change outcome scale",
+            axis_description="outcome color scale",
+        )
+
+    st.caption(
+        "The selected outcome is represented by color. Its scale stays fixed "
+        "when parameters or household states change unless you edit it above."
+    )
+
     xr = _range_selector(bundle, x, "surface_x_range")
     yr = _range_selector(bundle, y, "surface_y_range")
+
     linked_columns = [
-        col
-        for col in ("labor_income_state",)
-        if col in bundle.feature_spec.state_columns and col not in {x, y}
+        column
+        for column in ("labor_income_state",)
+        if (column in bundle.feature_spec.state_columns and column not in {x, y})
     ]
     linked_income = st.checkbox(
-        "Move other included income-state variables proportionally when current income varies",
+        "Move labor income state proportionally when current income varies",
         value=bool(linked_columns),
         disabled=("current_income" not in {x, y} or not linked_columns),
         key="surface_linked_income",
     )
+
     x_values = np.linspace(xr[0], xr[1], 65)
     y_values = np.linspace(yr[0], yr[1], 65)
     surface = make_policy_surface(
@@ -1111,26 +939,29 @@ def _surface_page(
         x_values=x_values,
         y_values=y_values,
         base=base,
-        linked_income=linked_income,
+        linked_income=bool(linked_income),
     )
-    table = surface.pivot(index="__y", columns="__x", values=f"pred_{output}")
+    table = surface.pivot(
+        index="__y",
+        columns="__x",
+        values=f"pred_{output}",
+    )
 
-    sample = _load_training_sample(str(bundle_path))
-    z_range = _output_axis_control(
-        bundle,
-        sample,
-        output,
-        context="two_dimensional",
-    )
     fig = go.Figure(
         data=go.Heatmap(
-            x=table.columns,
-            y=table.index,
-            z=table.to_numpy(),
-            zmin=float(z_range[0]),
-            zmax=float(z_range[1]),
+            x=table.columns.to_numpy(dtype=float),
+            y=table.index.to_numpy(dtype=float),
+            z=table.to_numpy(dtype=float),
+            zmin=float(outcome_range[0]),
+            zmax=float(outcome_range[1]),
             zauto=False,
             colorbar=dict(title=_pretty(output)),
+            hovertemplate=(
+                f"{_pretty(x)}: %{{x:.4g}}<br>"
+                f"{_pretty(y)}: %{{y:.4g}}<br>"
+                f"{_pretty(output)}: %{{z:.4g}}"
+                "<extra></extra>"
+            ),
         )
     )
     fig.update_layout(
@@ -1138,9 +969,9 @@ def _surface_page(
         height=650,
         xaxis_title=_pretty(x),
         yaxis_title=_pretty(y),
-        margin=dict(l=40, r=20, t=30, b=40),
+        margin=dict(l=40, r=30, t=30, b=40),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def _mpc_histogram_figure(
@@ -1439,7 +1270,7 @@ def _mpc_distribution_page(
         reference=reference,
         check_amount_dollars=float(check_amount),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.download_button(
         "Download household MPCs as CSV",
         data=response.to_csv(index=False).encode("utf-8"),
@@ -1482,7 +1313,7 @@ def _mpc_distribution_page(
         .sort_values("mean_mpc", ascending=False)
     )
     with st.expander("MPCs and state diagnostics by population type"):
-        st.dataframe(subgroup, hide_index=True, use_container_width=True)
+        st.dataframe(subgroup, hide_index=True, width="stretch")
         diagnostics = pd.DataFrame(
             {
                 "statistic": [
@@ -1499,7 +1330,7 @@ def _mpc_distribution_page(
                 ],
             }
         )
-        st.dataframe(diagnostics, hide_index=True, use_container_width=True)
+        st.dataframe(diagnostics, hide_index=True, width="stretch")
 
 
 def _exact_grid_comparison_page(
@@ -1546,7 +1377,7 @@ def _exact_grid_comparison_page(
     st.dataframe(
         display_summary,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Consumption R²": st.column_config.NumberColumn(format="%.4f"),
             "Deposit R²": st.column_config.NumberColumn(format="%.4f"),
@@ -1603,6 +1434,10 @@ def _exact_grid_comparison_page(
     if pd.isna(model_dir):
         st.error("The selected model has no model_dir entry.")
         return
+
+    model_dir = Path(str(model_dir)).expanduser()
+    if not model_dir.is_absolute():
+        model_dir = Path(bundle_path).expanduser().resolve().parent / model_dir
 
     metric_columns = st.columns(3)
 
@@ -1673,7 +1508,7 @@ def _exact_grid_comparison_page(
         st.dataframe(
             parameter_table,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
     # ------------------------------------------------------------------
@@ -1854,7 +1689,7 @@ def _exact_grid_comparison_page(
 
     st.plotly_chart(
         fig,
-        use_container_width=True,
+        width="stretch",
     )
 
     rmse = float(np.sqrt(np.mean(comparison["error"] ** 2)))
@@ -1880,7 +1715,7 @@ def _exact_grid_comparison_page(
         st.dataframe(
             comparison,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -1891,7 +1726,7 @@ def _validation_page(bundle: PolicySurrogateBundle) -> None:
         "asset changes are reconstructed from the accounting equations. Asset "
         "rows include persistence or zero-change benchmarks."
     )
-    st.dataframe(bundle.validation_metrics, hide_index=True, use_container_width=True)
+    st.dataframe(bundle.validation_metrics, hide_index=True, width="stretch")
     metrics = bundle.validation_metrics
     fig = go.Figure()
     fig.add_trace(
@@ -1919,7 +1754,7 @@ def _validation_page(bundle: PolicySurrogateBundle) -> None:
         xaxis_title="Policy choice",
         barmode="group",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     if "skill_vs_benchmark" in metrics:
         skill = metrics[metrics["skill_vs_benchmark"].notna()]
@@ -1939,7 +1774,7 @@ def _validation_page(bundle: PolicySurrogateBundle) -> None:
                 xaxis_title="Policy choice",
                 title="Improvement over persistence or zero change",
             )
-            st.plotly_chart(fig_skill, use_container_width=True)
+            st.plotly_chart(fig_skill, width="stretch")
 
     if not bundle.validation_by_model.empty:
         st.subheader("Error distribution across held-out models")
@@ -1954,8 +1789,8 @@ def _validation_page(bundle: PolicySurrogateBundle) -> None:
         ].sort_values("rmse")
         fig2 = go.Figure(go.Box(y=d["rmse"], boxpoints="all", name=_pretty(chosen)))
         fig2.update_layout(template="plotly_white", height=430, yaxis_title="RMSE")
-        st.plotly_chart(fig2, use_container_width=True)
-        st.dataframe(d, hide_index=True, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
+        st.dataframe(d, hide_index=True, width="stretch")
 
 
 def main() -> None:
