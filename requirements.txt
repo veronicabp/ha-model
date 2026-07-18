@@ -1,0 +1,9 @@
+streamlit
+plotly
+numpy
+pandas
+scipy
+scikit-learn
+joblib
+pyarrow
+tqdm
