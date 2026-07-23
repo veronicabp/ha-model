@@ -137,15 +137,6 @@ pair_role = pd.to_numeric(sample["mpc_pair_role"], errors="coerce")
 
 keep = sample["model_id"].isin(public_ids) & pair_id.ge(0) & pair_role.isin([0, 1])
 heldout_pairs = sample.loc[keep].copy()
-del sample
-
-if heldout_pairs.empty:
-    raise RuntimeError("No held-out MPC-pair rows were found for deployed models.")
-
-heldout_pairs.to_parquet(
-    APP_DATA_DIR / "heldout_mpc_pairs.parquet",
-    index=False,
-)
 
 # Data for axes
 # Old website default axis ranges: 0.5th to 99.5th percentiles.
@@ -183,6 +174,17 @@ pd.DataFrame(axis_rows).to_csv(
     APP_DATA_DIR / "output_axis_ranges.csv",
     index=False,
 )
+
+del sample
+
+if heldout_pairs.empty:
+    raise RuntimeError("No held-out MPC-pair rows were found for deployed models.")
+
+heldout_pairs.to_parquet(
+    APP_DATA_DIR / "heldout_mpc_pairs.parquet",
+    index=False,
+)
+
 
 # Remove obsolete full-sample files from the deployment directory.
 for filename in (
