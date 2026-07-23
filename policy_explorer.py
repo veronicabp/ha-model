@@ -205,12 +205,28 @@ def _out_of_sample_model_summary(
     catalog_small = catalog.copy()
     catalog_small["model_id"] = catalog_small["model_id"].astype(str)
 
+    catalog_small = catalog_small[["model_id", "model_dir"]].drop_duplicates(
+        subset=["model_id"]
+    )
+
+    # Keep only held-out models explicitly present in model_catalog.csv.
     summary = summary.merge(
-        catalog_small[["model_id", "model_dir"]],
+        catalog_small,
         on="model_id",
-        how="left",
+        how="inner",
         validate="one_to_one",
     )
+
+    # Also exclude catalog rows without a usable model directory value.
+    summary = summary[
+        summary["model_dir"].notna()
+        & summary["model_dir"].astype(str).str.strip().ne("")
+    ].copy()
+
+    if summary.empty:
+        raise ValueError(
+            "No held-out validation models are present in model_catalog.csv."
+        )
 
     summary = summary.sort_values(
         ["mean_r2", "model_id"],
