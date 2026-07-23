@@ -4,21 +4,22 @@ The module reads ``metadata.json`` and ``arrays.npz`` from many solved
 heterogeneous-agent models, samples each policy grid with equal weight, and
 estimates smooth policy maps over household states and model parameters.
 
-The primitive regression targets are
+The saved primitive policies are consumption and the net deposit from the
+liquid account into the illiquid account.  The surrogate fits those two objects
+and an auxiliary total-liquid-outflow target,
 
-* consumption; and
-* the net deposit from the liquid account into the illiquid account.
+    consumption + deposit + adjustment_cost,
 
-Next liquid assets, next illiquid assets, both asset changes, and both drifts are
-then reconstructed from the HA model's budget equations.  They are never fitted
-as independent choices.  This guarantees internal accounting consistency and
-makes held-out liquid-asset performance directly interpretable.
+which directly identifies liquid saving.  Predictions are reconciled back to a
+single accounting-consistent consumption/deposit pair.  Next assets, asset
+changes, and drifts are then reconstructed from the HA budget equations.
 
 The default feature map is a structured polynomial with ridge regularization. It
 contains continuous main effects and powers, state-state interactions,
 state-parameter interactions, one-hot categorical variables, and
-category-specific slopes.  A smooth random-Fourier RBF alternative is also
-available.
+category-specific slopes. Consumption coefficients can additionally be fitted
+to exact finite-difference MPC equations from paired liquid-asset states. A
+smooth random-Fourier RBF alternative is also available.
 
 Expected policy-array layout
 ----------------------------
@@ -45,6 +46,8 @@ import pandas as pd
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GroupShuffleSplit
+from sklearn.preprocessing import SplineTransformer
+from scipy.sparse.linalg import LinearOperator, lsmr
 
 try:
     from tqdm.auto import tqdm as _tqdm
@@ -167,6 +170,7 @@ class GridSchema:
     key_overrides: Mapping[str, str] = field(default_factory=dict)
     money_units: str = "model"  # "model" or "data"
     include_derived_metadata_parameters: bool = False
+    require_compact_policies: bool = False
 
     def __post_init__(self) -> None:
         layout = self.policy_layout.upper()
@@ -414,18 +418,141 @@ def _model_is_usable(
     *,
     accepted_statuses: Sequence[str] = ("success", "exists", "converged"),
     max_solver_distance: float | None = None,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
+    """Return usability, a human-readable reason, and a stable reason code.
+
+    ``max_solver_distance`` is an explicit exclusion rule.  The HA solver that
+    generated the grids labels a model ``success`` even when it reaches the
+    iteration cap above its convergence tolerance, so a strict distance cutoff
+    can legitimately exclude many otherwise readable model directories.
+    """
+
     diag = metadata.get("diagnostics", {}) or {}
     status = diag.get("status")
     if status is not None:
         accepted = {str(s).lower() for s in accepted_statuses}
         if str(status).lower() not in accepted:
-            return False, f"solver status={status!r}"
+            return False, f"solver status={status!r}", "solver_status"
+
     if max_solver_distance is not None:
         distance = diag.get("max_distance")
-        if distance is not None and np.isfinite(float(distance)):
-            if float(distance) > float(max_solver_distance):
-                return False, f"max solver distance {distance} exceeds threshold"
+        if distance is not None:
+            try:
+                distance_f = float(distance)
+            except (TypeError, ValueError):
+                distance_f = np.nan
+            if np.isfinite(distance_f) and distance_f > float(max_solver_distance):
+                return (
+                    False,
+                    f"max solver distance {distance_f:.8g} exceeds "
+                    f"threshold {float(max_solver_distance):.8g}",
+                    "solver_distance",
+                )
+
+    return True, "", ""
+
+
+def _inspect_policy_storage(
+    model_dir: Path,
+    metadata: Mapping[str, Any],
+    schema: GridSchema,
+) -> dict[str, Any]:
+    """Inspect the saved policy representation without decompressing tensors.
+
+    The current compact format stores only consumption and deposit as full
+    GHKEBA policy arrays. Older formats may additionally contain drifts or
+    next-asset arrays. Both are readable, but compact-only runs can request a
+    strict check through ``GridSchema.require_compact_policies``.
+    """
+
+    arrays_path = model_dir / "arrays.npz"
+    with np.load(arrays_path, allow_pickle=False) as z:
+        keys = set(z.files)
+        consumption_key = _find_array_key(z, "consumption", schema, required=False)
+        deposit_key = _find_array_key(z, "deposit", schema, required=False)
+        liquid_drift_key = _find_array_key(
+            z, "liquid_drift", schema, required=False
+        )
+        illiquid_drift_key = _find_array_key(
+            z, "illiquid_drift", schema, required=False
+        )
+        next_liquid_key = _find_array_key(
+            z, "next_liquid_assets", schema, required=False
+        )
+        next_illiquid_key = _find_array_key(
+            z, "next_illiquid_assets", schema, required=False
+        )
+
+        if consumption_key is None:
+            policy_dtype = None
+            policy_shape = None
+        else:
+            policy_dtype = str(z[consumption_key].dtype)
+            policy_shape = "x".join(str(int(v)) for v in z[consumption_key].shape)
+
+    has_drift = liquid_drift_key is not None or illiquid_drift_key is not None
+    has_next = next_liquid_key is not None or next_illiquid_key is not None
+    has_compact_primitives = consumption_key is not None and deposit_key is not None
+
+    if has_compact_primitives and not has_drift and not has_next:
+        storage_format = "compact_consumption_deposit"
+    elif has_compact_primitives:
+        storage_format = "consumption_deposit_with_legacy_arrays"
+    elif consumption_key is not None and illiquid_drift_key is not None:
+        storage_format = "legacy_deposit_recoverable_from_drift"
+    else:
+        storage_format = "incomplete"
+
+    declared = metadata.get("saved_arrays", {}) or {}
+    declared_policy_arrays = declared.get("policy_arrays")
+    declared_drifts_saved = declared.get("drifts_saved")
+
+    return {
+        "policy_storage_format": storage_format,
+        "policy_dtype": policy_dtype,
+        "policy_shape": policy_shape,
+        "has_consumption_policy": consumption_key is not None,
+        "has_deposit_policy": deposit_key is not None,
+        "has_saved_liquid_drift": liquid_drift_key is not None,
+        "has_saved_illiquid_drift": illiquid_drift_key is not None,
+        "has_saved_next_liquid_assets": next_liquid_key is not None,
+        "has_saved_next_illiquid_assets": next_illiquid_key is not None,
+        "metadata_policy_arrays": (
+            json.dumps(declared_policy_arrays)
+            if declared_policy_arrays is not None
+            else None
+        ),
+        "metadata_drifts_saved": declared_drifts_saved,
+        "array_key_count": len(keys),
+    }
+
+
+def _validate_policy_storage_for_training(
+    storage: Mapping[str, Any],
+    *,
+    schema: GridSchema,
+) -> tuple[bool, str]:
+    """Validate that a saved model can supply consumption and deposit."""
+
+    if not bool(storage.get("has_consumption_policy")):
+        return False, "missing saved consumption policy"
+
+    has_deposit = bool(storage.get("has_deposit_policy"))
+    has_illiquid_drift = bool(storage.get("has_saved_illiquid_drift"))
+    if not has_deposit and not has_illiquid_drift:
+        return False, "missing deposit policy and legacy illiquid drift fallback"
+
+    if (
+        schema.require_compact_policies
+        and storage.get("policy_storage_format")
+        != "compact_consumption_deposit"
+    ):
+        return (
+            False,
+            "not compact consumption+deposit storage; rerun without "
+            "--require-compact-policies to accept legacy arrays",
+        )
+
     return True, ""
 
 
@@ -437,6 +564,8 @@ def build_model_catalog(
     verbose: bool = True,
     show_progress: bool = True,
 ) -> pd.DataFrame:
+    """Build a transparent model catalog with explicit rejection codes."""
+
     rows: list[dict[str, Any]] = []
     iterator = _progress_iter(
         model_dirs,
@@ -461,12 +590,28 @@ def build_model_catalog(
                 f"  catalogued {position:,}/{len(model_dirs):,} models",
                 verbose=verbose,
             )
+
         d = Path(raw)
         try:
             meta = _read_json(d / "metadata.json")
-            usable, reason = _model_is_usable(
-                meta, max_solver_distance=max_solver_distance
+            diag = meta.get("diagnostics", {}) or {}
+            usable, reason, rejection_code = _model_is_usable(
+                meta,
+                max_solver_distance=max_solver_distance,
             )
+
+            storage = _inspect_policy_storage(d, meta, schema)
+            storage_usable, storage_reason = _validate_policy_storage_for_training(
+                storage,
+                schema=schema,
+            )
+            if usable and not storage_usable:
+                usable = False
+                reason = storage_reason
+                rejection_code = "policy_storage"
+            elif not usable and storage_reason:
+                reason = f"{reason}; {storage_reason}"
+
             numeric_params = extract_numeric_parameters(
                 meta,
                 include_derived=schema.include_derived_metadata_parameters,
@@ -475,13 +620,25 @@ def build_model_catalog(
                 meta,
                 include_derived=schema.include_derived_metadata_parameters,
             )
+
+            distance_raw = diag.get("max_distance")
+            try:
+                distance = float(distance_raw)
+            except (TypeError, ValueError):
+                distance = np.nan
+
             row: dict[str, Any] = {
                 "model_id": _model_id(meta, d),
                 "model_dir": str(d),
                 "usable": bool(usable),
+                "rejection_code": rejection_code,
                 "reason": reason,
+                "solver_status": diag.get("status"),
+                "solver_max_distance": distance,
+                "solver_max_iterations": diag.get("max_iterations"),
                 "money_scale": float(meta.get("money_scale", 1.0) or 1.0),
             }
+            row.update(storage)
             row.update(numeric_params)
             row.update(categorical_params)
             rows.append(row)
@@ -491,10 +648,15 @@ def build_model_catalog(
                     "model_id": d.name,
                     "model_dir": str(d),
                     "usable": False,
-                    "reason": f"metadata error: {exc}",
+                    "rejection_code": "metadata_or_array_error",
+                    "reason": f"metadata/array error: {exc}",
+                    "solver_status": None,
+                    "solver_max_distance": np.nan,
+                    "solver_max_iterations": np.nan,
                     "money_scale": np.nan,
                 }
             )
+
     return pd.DataFrame(rows)
 
 
@@ -671,6 +833,147 @@ def _stratified_coordinates(
     return out
 
 
+
+def _mpc_aware_coordinates(
+    canonical_shape: tuple[int, int, int, int, int, int],
+    n: int,
+    rng: np.random.Generator,
+    *,
+    liquid_grid: np.ndarray,
+    pair_share: float,
+    check_sizes: Sequence[float],
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+    """Sample broad grid points plus balanced liquid-wealth pairs.
+
+    Earlier versions deliberately concentrated pair baselines very close to the
+    borrowing constraint.  That was useful diagnostically, but it changed the
+    effective training distribution and could make the fitted MPC function too
+    steep near zero liquidity.  The revised sampler stratifies pair baselines
+    over the full feasible liquid grid and then adds a small set of forced
+    lower-bound anchors.  It therefore learns local slopes without letting
+    low-liquid states dominate the level fit.
+
+    Returns
+    -------
+    coords
+        Coordinate arrays in canonical GHKEBA order.
+    pair_id
+        Integer pair identifier, or -1 for ordinary non-paired rows.
+    pair_role
+        0 for baseline, 1 for treated, and -1 for ordinary rows.
+    pair_check
+        Actual liquid-grid difference between treated and baseline rows.
+    """
+
+    if n <= 0:
+        raise ValueError("n must be positive.")
+
+    share = float(np.clip(pair_share, 0.0, 0.90))
+    grid = np.asarray(liquid_grid, dtype=float)
+    if grid.ndim != 1 or len(grid) < 2:
+        raise ValueError("liquid_grid must contain at least two points.")
+    if not np.all(np.diff(grid) > 0.0):
+        raise ValueError("liquid_grid must be strictly increasing.")
+
+    checks = np.asarray(
+        [float(x) for x in check_sizes if np.isfinite(float(x)) and float(x) > 0.0],
+        dtype=float,
+    )
+    if checks.size == 0:
+        checks = np.array([0.05, 0.10, 0.20], dtype=float)
+
+    n_pairs = int(math.floor((share * n) / 2.0))
+    n_pair_rows = 2 * n_pairs
+    n_random = n - n_pair_rows
+
+    letters = "GHKEBA"
+    pieces: dict[str, list[np.ndarray]] = {letter: [] for letter in letters}
+    pair_ids: list[np.ndarray] = []
+    pair_roles: list[np.ndarray] = []
+    pair_checks: list[np.ndarray] = []
+
+    if n_random > 0:
+        ordinary = _stratified_coordinates(canonical_shape, n_random, rng)
+        for letter in letters:
+            pieces[letter].append(ordinary[letter])
+        pair_ids.append(np.full(n_random, -1, dtype=np.int64))
+        pair_roles.append(np.full(n_random, -1, dtype=np.int8))
+        pair_checks.append(np.full(n_random, np.nan, dtype=float))
+
+    if n_pairs > 0:
+        pair_states = _stratified_coordinates(canonical_shape, n_pairs, rng)
+        base_b = np.empty(n_pairs, dtype=np.int64)
+        treated_b = np.empty(n_pairs, dtype=np.int64)
+        actual_check = np.empty(n_pairs, dtype=float)
+
+        span = float(grid[-1] - grid[0])
+        usable_checks = checks[checks < span - EPS]
+        if usable_checks.size == 0:
+            usable_checks = np.array([max(span / 10.0, EPS)], dtype=float)
+        draw_checks = rng.choice(usable_checks, size=n_pairs, replace=True)
+
+        # Stratification gives approximately equal coverage over feasible
+        # baseline positions.  A few deterministic lower-bound anchors retain
+        # precision exactly where the borrowing constraint begins to bind.
+        baseline_quantiles = (np.arange(n_pairs, dtype=float) + rng.random(n_pairs)) / n_pairs
+        rng.shuffle(baseline_quantiles)
+
+        for i, desired_check in enumerate(draw_checks):
+            max_start_value = grid[-1] - float(desired_check)
+            max_start = int(np.searchsorted(grid, max_start_value, side="right") - 1)
+            max_start = int(np.clip(max_start, 0, len(grid) - 2))
+
+            start = int(np.floor(baseline_quantiles[i] * (max_start + 1)))
+            start = int(np.clip(start, 0, max_start))
+
+            # Force a small number of exact low-slack pairs, without making
+            # them half of the training sample as in the earlier specification.
+            if i < min(8, n_pairs):
+                start = min(i // 2, max_start)
+
+            target_value = grid[start] + float(desired_check)
+            right = int(np.searchsorted(grid, target_value, side="left"))
+            right = int(np.clip(right, start + 1, len(grid) - 1))
+            left = max(start + 1, right - 1)
+            stop = min(
+                (left, right),
+                key=lambda j: abs(float(grid[j]) - target_value),
+            )
+            stop = int(np.clip(stop, start + 1, len(grid) - 1))
+
+            base_b[i] = start
+            treated_b[i] = stop
+            actual_check[i] = float(grid[stop] - grid[start])
+
+        for letter in letters:
+            if letter == "B":
+                values = np.empty(n_pair_rows, dtype=np.int64)
+                values[0::2] = base_b
+                values[1::2] = treated_b
+            else:
+                values = np.repeat(pair_states[letter], 2)
+            pieces[letter].append(values)
+
+        pair_ids.append(np.repeat(np.arange(n_pairs, dtype=np.int64), 2))
+        roles = np.empty(n_pair_rows, dtype=np.int8)
+        roles[0::2] = 0
+        roles[1::2] = 1
+        pair_roles.append(roles)
+        pair_checks.append(np.repeat(actual_check, 2))
+
+    coords = {
+        letter: np.concatenate(pieces[letter]).astype(np.int64, copy=False)
+        for letter in letters
+    }
+    pair_id = np.concatenate(pair_ids)
+    pair_role = np.concatenate(pair_roles)
+    pair_check = np.concatenate(pair_checks)
+
+    if len(pair_id) != n:
+        raise RuntimeError("MPC-aware sampler returned the wrong number of rows.")
+
+    return coords, pair_id, pair_role, pair_check
+
 def _resolve_ages(
     arrays: Mapping[str, np.ndarray],
     metadata: Mapping[str, Any],
@@ -839,7 +1142,9 @@ def _accounting_values_from_metadata(
         "acct__xi": float(xi),
         "acct__illiquid_cost_floor": float(cfg.get("ct_illiquid_cost_floor", 1.0e-6))
         * float(money_factor),
+        "acct__policy_drift_clip": float(cfg.get("ct_policy_drift_clip", 0.0)),
         "acct__retirement_age": float(cfg.get("retirement_age", np.inf)),
+        "acct__terminal_age": float(cfg.get("max_age", np.inf)),
         "acct__tax_kind": str(tax.get("kind", "none")),
         "acct__tax_flat_rate": float(tax.get("flat_rate", 0.0)),
         "acct__tax_deduction": float(tax.get("deduction", 0.0)) * float(money_factor),
@@ -851,9 +1156,89 @@ def _accounting_values_from_metadata(
     for key, value in values.items():
         if key == "acct__tax_kind":
             continue
-        if not np.isfinite(float(value)) and key != "acct__retirement_age":
+        if not np.isfinite(float(value)) and key not in {
+            "acct__retirement_age",
+            "acct__terminal_age",
+            "acct__policy_drift_clip",
+        }:
             raise ValueError(f"Invalid accounting metadata {key}={value!r}.")
     return values
+
+
+def _reconstruct_saved_policy_accounting(
+    *,
+    consumption: np.ndarray,
+    deposit: np.ndarray,
+    current_liquid_assets: np.ndarray,
+    current_illiquid_assets: np.ndarray,
+    after_tax_income: np.ndarray,
+    liquid_index: np.ndarray,
+    illiquid_index: np.ndarray,
+    liquid_grid: np.ndarray,
+    illiquid_grid: np.ndarray,
+    accounting: Mapping[str, Any],
+    money_factor: float,
+) -> dict[str, np.ndarray]:
+    """Reconstruct all redundant policies from saved consumption and deposit.
+
+    This mirrors the compact saved-model prediction path: apply the resource
+    equations, the solver's optional drift clipping, the boundary state
+    constraints, and finally the annual transition and grid projection.  The
+    function works in the units selected by ``GridSchema.money_units``.
+    """
+
+    c = np.asarray(consumption, dtype=float)
+    d = np.asarray(deposit, dtype=float)
+    b = np.asarray(current_liquid_assets, dtype=float)
+    a = np.asarray(current_illiquid_assets, dtype=float)
+    y = np.asarray(after_tax_income, dtype=float)
+    ib = np.asarray(liquid_index, dtype=np.int64)
+    ia = np.asarray(illiquid_index, dtype=np.int64)
+
+    a_floor = max(float(accounting["acct__illiquid_cost_floor"]), EPS)
+    chi0 = float(accounting["acct__chi0"])
+    chi1 = float(accounting["acct__chi1"])
+    xi = float(accounting["acct__xi"])
+    rb_pos = float(accounting["acct__rb_pos_ct"])
+    rb_neg = float(accounting["acct__rb_neg_ct"])
+    ra = float(accounting["acct__ra_ct"])
+
+    cost = chi0 * np.abs(d) + 0.5 * chi1 * d**2 / np.maximum(a, a_floor)
+    liquid_return = np.where(b >= 0.0, rb_pos * b, rb_neg * b)
+    sb = (1.0 - xi) * y + liquid_return - d - cost - c
+    sa = ra * a + xi * y + d
+
+    drift_clip = float(accounting.get("acct__policy_drift_clip", 0.0))
+    if np.isfinite(drift_clip) and drift_clip > 0.0:
+        sb = np.clip(sb, -drift_clip, drift_clip)
+        sa = np.clip(sa, -drift_clip, drift_clip)
+
+    # Match policy_update exactly at numerical state boundaries.
+    sb = np.where(ib == 0, np.maximum(sb, 0.0), sb)
+    sb = np.where(ib == len(liquid_grid) - 1, np.minimum(sb, 0.0), sb)
+    sa = np.where(ia == 0, np.maximum(sa, 0.0), sa)
+    sa = np.where(ia == len(illiquid_grid) - 1, np.minimum(sa, 0.0), sa)
+
+    dt = float(accounting["acct__ct_time_step"])
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"Invalid ct_time_step={dt!r} in metadata.")
+
+    b_lo = float(liquid_grid[0]) * float(money_factor)
+    b_hi = float(liquid_grid[-1]) * float(money_factor)
+    a_lo = float(illiquid_grid[0]) * float(money_factor)
+    a_hi = float(illiquid_grid[-1]) * float(money_factor)
+    next_b = np.clip(b + dt * sb, b_lo, b_hi)
+    next_a = np.clip(a + dt * sa, a_lo, a_hi)
+
+    return {
+        "adjustment_cost": cost,
+        "liquid_drift": sb,
+        "illiquid_drift": sa,
+        "next_liquid_assets": next_b,
+        "next_illiquid_assets": next_a,
+        "delta_liquid_assets": next_b - b,
+        "delta_illiquid_assets": next_a - a,
+    }
 
 
 def sample_one_saved_policy_grid(
@@ -864,6 +1249,8 @@ def sample_one_saved_policy_grid(
     schema: GridSchema = GridSchema(),
     random_state: int = 0,
     include_optional_policies: bool = True,
+    mpc_pair_share: float = 0.40,
+    mpc_check_sizes: Sequence[float] = (0.02, 0.05, 0.10, 0.188679, 0.20, 0.50),
 ) -> pd.DataFrame:
     """Sample one saved policy grid into a tidy state-policy table.
 
@@ -880,6 +1267,13 @@ def sample_one_saved_policy_grid(
 
     with np.load(d / "arrays.npz", allow_pickle=False) as z:
         arrays = {k: z[k] for k in z.files}
+
+    storage = _inspect_policy_storage(d, metadata, schema)
+    storage_usable, storage_reason = _validate_policy_storage_for_training(
+        storage, schema=schema
+    )
+    if not storage_usable:
+        raise ValueError(f"Unsupported saved-policy representation: {storage_reason}.")
 
     consumption_key = _find_array_key(arrays, "consumption", schema, required=True)
     deposit_key = _find_array_key(arrays, "deposit", schema, required=False)
@@ -900,17 +1294,6 @@ def sample_one_saved_policy_grid(
             "policy or illiquid_drift from which deposit can be recovered. "
             f"Available arrays: {sorted(arrays)}"
         )
-    if next_liquid_key is None and liquid_drift_key is None:
-        raise KeyError(
-            "Could not find either a next-liquid-assets policy or liquid_drift. "
-            f"Available arrays: {sorted(arrays)}"
-        )
-    if next_illiquid_key is None and illiquid_drift_key is None:
-        raise KeyError(
-            "Could not find either a next-illiquid-assets policy or illiquid_drift. "
-            f"Available arrays: {sorted(arrays)}"
-        )
-
     c_arr = arrays[consumption_key]  # type: ignore[index]
     canonical_shape = _policy_shape_to_canonical(c_arr.shape, schema.policy_layout)
     g_count, h_count, k_count, e_count, b_count, a_count = canonical_shape
@@ -949,8 +1332,18 @@ def sample_one_saved_policy_grid(
     group_values = _metadata_group_values(metadata, g_count)
     factor = _money_factor(metadata, schema)
     accounting = _accounting_values_from_metadata(metadata, money_factor=factor)
+    # The saved age grid is authoritative.  Store its last age explicitly so
+    # prediction-time lifecycle features match this exact model.
+    accounting["acct__terminal_age"] = float(np.max(ages))
 
-    coords = _stratified_coordinates(canonical_shape, n_rows, rng)
+    coords, mpc_pair_id, mpc_pair_role, mpc_pair_check = _mpc_aware_coordinates(
+        canonical_shape,
+        n_rows,
+        rng,
+        liquid_grid=liquid_grid,
+        pair_share=mpc_pair_share,
+        check_sizes=mpc_check_sizes,
+    )
     g, h, k, e, b, a = (coords[x] for x in "GHKEBA")
 
     after_tax_key = _find_array_key(arrays, "after_tax_income", schema, required=False)
@@ -1039,55 +1432,24 @@ def sample_one_saved_policy_grid(
             - float(accounting["acct__xi"]) * after_tax
         )
 
-    a_floor = max(float(accounting["acct__illiquid_cost_floor"]), EPS)
-    adjustment_cost = float(accounting["acct__chi0"]) * np.abs(deposit) + 0.5 * float(
-        accounting["acct__chi1"]
-    ) * deposit**2 / np.maximum(current_a, a_floor)
-    rb = np.where(
-        current_b >= 0.0,
-        float(accounting["acct__rb_pos_ct"]),
-        float(accounting["acct__rb_neg_ct"]),
+    reconstructed = _reconstruct_saved_policy_accounting(
+        consumption=consumption,
+        deposit=deposit,
+        current_liquid_assets=current_b,
+        current_illiquid_assets=current_a,
+        after_tax_income=after_tax,
+        liquid_index=b,
+        illiquid_index=a,
+        liquid_grid=liquid_grid,
+        illiquid_grid=illiquid_grid,
+        accounting=accounting,
+        money_factor=factor,
     )
-    liquid_drift_identity = (
-        (1.0 - float(accounting["acct__xi"])) * after_tax
-        + rb * current_b
-        - deposit
-        - adjustment_cost
-        - consumption
-    )
-    illiquid_drift_identity = (
-        float(accounting["acct__ra_ct"]) * current_a
-        + float(accounting["acct__xi"]) * after_tax
-        + deposit
-    )
-
-    dt = float(accounting["acct__ct_time_step"])
-    if not np.isfinite(dt) or dt <= 0:
-        raise ValueError(f"Invalid ct_time_step={dt!r} in metadata.")
-
-    if next_liquid_key is not None:
-        next_b_model = _index_policy_array(
-            arrays[next_liquid_key], schema.policy_layout, coords
-        )
-        next_b = np.asarray(next_b_model, dtype=float) * factor
-    else:
-        next_b = np.clip(
-            current_b + dt * liquid_drift_identity,
-            liquid_grid[0] * factor,
-            liquid_grid[-1] * factor,
-        )
-
-    if next_illiquid_key is not None:
-        next_a_model = _index_policy_array(
-            arrays[next_illiquid_key], schema.policy_layout, coords
-        )
-        next_a = np.asarray(next_a_model, dtype=float) * factor
-    else:
-        next_a = np.clip(
-            current_a + dt * illiquid_drift_identity,
-            illiquid_grid[0] * factor,
-            illiquid_grid[-1] * factor,
-        )
+    adjustment_cost = reconstructed["adjustment_cost"]
+    liquid_drift_identity = reconstructed["liquid_drift"]
+    illiquid_drift_identity = reconstructed["illiquid_drift"]
+    next_b = reconstructed["next_liquid_assets"]
+    next_a = reconstructed["next_illiquid_assets"]
 
     data: dict[str, Any] = {
         "model_id": np.repeat(model_id, n_rows),
@@ -1095,7 +1457,11 @@ def sample_one_saved_policy_grid(
         "education_state": g.astype(int),
         "education": np.asarray([group_values[i] for i in g], dtype=object),
         "age": age_values,
+        "terminal_age": np.repeat(float(np.max(ages)), n_rows),
         "years_to_retirement": retirement_age - age_values,
+        "years_to_retirement_positive": np.maximum(retirement_age - age_values, 0.0),
+        "years_since_retirement": np.maximum(age_values - retirement_age, 0.0),
+        "years_to_terminal": np.maximum(float(np.max(ages)) - age_values, 0.0),
         "is_retired": retired.astype(int),
         "income_state": k.astype(int),
         "employment_state": e.astype(int),
@@ -1122,12 +1488,19 @@ def sample_one_saved_policy_grid(
         "consumption": consumption,
         "deposit": deposit,
         "adjustment_cost": adjustment_cost,
+        # Total use of liquid resources.  This is the natural target for
+        # accurately predicting liquid saving because liquid_drift equals
+        # liquid resources minus this object.
+        "liquid_outflow": consumption + deposit + adjustment_cost,
         "liquid_drift": liquid_drift_identity,
         "illiquid_drift": illiquid_drift_identity,
         "next_liquid_assets": next_b,
         "next_illiquid_assets": next_a,
         "delta_liquid_assets": next_b - current_b,
         "delta_illiquid_assets": next_a - current_a,
+        "mpc_pair_id": mpc_pair_id,
+        "mpc_pair_role": mpc_pair_role,
+        "mpc_check_units": mpc_pair_check * factor,
         "grid_g": g,
         "grid_h": h,
         "grid_k": k,
@@ -1150,6 +1523,20 @@ def sample_one_saved_policy_grid(
             data["saved_illiquid_drift"] = (
                 _index_policy_array(
                     arrays[illiquid_drift_key], schema.policy_layout, coords
+                )
+                * factor
+            )
+        if next_liquid_key is not None:
+            data["saved_next_liquid_assets"] = (
+                _index_policy_array(
+                    arrays[next_liquid_key], schema.policy_layout, coords
+                )
+                * factor
+            )
+        if next_illiquid_key is not None:
+            data["saved_next_illiquid_assets"] = (
+                _index_policy_array(
+                    arrays[next_illiquid_key], schema.policy_layout, coords
                 )
                 * factor
             )
@@ -1176,6 +1563,7 @@ def sample_one_saved_policy_grid(
         "illiquid_assets",
         "consumption",
         "deposit",
+        "liquid_outflow",
         "next_liquid_assets",
         "next_illiquid_assets",
     ]
@@ -1203,6 +1591,8 @@ def build_policy_dataset(
     rows_per_model: int = 2_000,
     max_total_rows: int = 250_000,
     max_models: int | None = None,
+    mpc_pair_share: float = 0.40,
+    mpc_check_sizes: Sequence[float] = (0.02, 0.05, 0.10, 0.188679, 0.20, 0.50),
     parameter_include: Sequence[str] | None = None,
     parameter_exclude: Sequence[str] = (),
     categorical_parameter_include: Sequence[str] | None = None,
@@ -1221,8 +1611,14 @@ def build_policy_dataset(
 
     stage_start = time.perf_counter()
     dirs = discover_model_dirs(model_root, manifest_path=manifest_path)
-    if max_models is not None:
-        dirs = dirs[: int(max_models)]
+    if max_models is not None and len(dirs) > int(max_models):
+        # Random rather than lexicographic truncation, which can accidentally
+        # select a nonrepresentative block when model IDs are ordered by run.
+        selection_rng = np.random.default_rng(random_state)
+        chosen = np.sort(
+            selection_rng.choice(len(dirs), size=int(max_models), replace=False)
+        )
+        dirs = [dirs[int(i)] for i in chosen]
     if not dirs:
         raise FileNotFoundError(f"No saved models found under {model_root}.")
     _status(
@@ -1261,11 +1657,53 @@ def build_policy_dataset(
         f"categorical parameters: {len(categorical_parameter_columns):,}",
         verbose=verbose,
     )
+    if "policy_storage_format" in catalog:
+        storage_counts_all = (
+            catalog["policy_storage_format"]
+            .fillna("unreadable")
+            .value_counts(dropna=False)
+            .to_dict()
+        )
+        storage_text = ", ".join(
+            f"{name}={int(count):,}" for name, count in storage_counts_all.items()
+        )
+        _status(f"  policy storage across all discovered models: {storage_text}", verbose=verbose)
+
+    rejected = catalog[~catalog["usable"]].copy()
+    if not rejected.empty:
+        if "rejection_code" in rejected:
+            reason_counts = (
+                rejected["rejection_code"]
+                .replace("", "unspecified")
+                .fillna("unspecified")
+                .value_counts()
+            )
+            reason_text = ", ".join(
+                f"{name}={int(count):,}" for name, count in reason_counts.items()
+            )
+            _status(f"  rejected models by reason: {reason_text}", verbose=verbose)
+        if "solver_max_distance" in rejected and max_solver_distance is not None:
+            distances = pd.to_numeric(
+                rejected.loc[
+                    rejected.get("rejection_code", "") == "solver_distance",
+                    "solver_max_distance",
+                ],
+                errors="coerce",
+            ).dropna()
+            if len(distances):
+                _status(
+                    "  excluded solver distances: "
+                    f"min={distances.min():.3g}, median={distances.median():.3g}, "
+                    f"max={distances.max():.3g}; cutoff={float(max_solver_distance):.3g}",
+                    verbose=verbose,
+                )
     effective_rows = min(int(rows_per_model), max(1, int(max_total_rows) // n_models))
-    if effective_rows < 100:
+    if effective_rows < 250:
         warnings.warn(
             f"Only {effective_rows} rows/model fit under max_total_rows. "
-            "Increase max_total_rows for reliable state coverage.",
+            "That is usually too sparse for a two-asset lifecycle surface and "
+            "MPC finite differences. Increase max_total_rows, reduce max_models, "
+            "or both; 250-500 rows/model is a practical minimum for initial fits.",
             stacklevel=2,
         )
 
@@ -1316,6 +1754,8 @@ def build_policy_dataset(
                 parameter_values=params,
                 schema=schema,
                 random_state=int(rng.integers(0, np.iinfo(np.int32).max)),
+                mpc_pair_share=mpc_pair_share,
+                mpc_check_sizes=mpc_check_sizes,
             )
             frames.append(frame)
         except Exception as exc:
@@ -1417,11 +1857,7 @@ def read_policy_dataset(path: str | Path) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 
 
-# Continuous state specification used by default.  After-tax income is included
-# because it is the income flow that enters both asset-accounting equations.
-# It is nevertheless recomputed from gross income and the selected tax policy
-# before every prediction, so the interactive page cannot create a stale or
-# internally inconsistent after-tax-income state.
+# Primitive household states exposed to downstream visualization code.
 DEFAULT_STATE_COLUMNS = (
     "age",
     "current_income",
@@ -1430,6 +1866,70 @@ DEFAULT_STATE_COLUMNS = (
     "liquid_assets",
     "illiquid_assets",
 )
+
+# Internally generated state features that align policy functions across income
+# scales and borrowing limits.  These are regression inputs but are not exposed
+# as independently adjustable household states in the visualization page.
+DEFAULT_ENGINEERED_STATE_COLUMNS = (
+    "liquid_slack",
+    "liquid_assets_to_income",
+    "liquid_slack_to_income",
+    "illiquid_assets_to_income",
+    "after_tax_income_to_income",
+    "cash_on_hand_to_income",
+    # Lifecycle-horizon variables are critical for MPCs.  The true finite-horizon
+    # policy becomes much steeper close to the terminal age, especially after
+    # retirement.  Age alone plus a retired dummy cannot represent that shape.
+    "years_to_terminal",
+    "years_since_retirement",
+    "years_to_retirement_positive",
+)
+
+# Current gross income is retained as an input/display variable, but is redundant
+# in the regression once after-tax income, the persistent labor-income state,
+# and the tax parameters are present.  Excluding it materially reduces
+# collinearity without changing how the visualization is controlled.
+DEFAULT_REDUNDANT_STATE_COLUMNS = ("current_income",)
+
+DEFAULT_SPLINE_COLUMNS = (
+    "liquid_slack_to_income",
+    "illiquid_assets_to_income",
+    "years_to_terminal",
+)
+
+# A tensor-product spline lets the liquid-wealth slope vary smoothly with the
+# remaining lifecycle horizon.  This replaces the earlier global retiree slope
+# shift that generated an artificial second MPC peak.
+DEFAULT_SPLINE_TENSOR_PAIRS = (
+    ("liquid_slack_to_income", "years_to_terminal"),
+)
+
+# Keep is_retired as a level indicator, but do not allow it to create an
+# unrestricted discrete jump in every state slope or every liquid spline.
+DEFAULT_CATEGORICAL_SLOPE_EXCLUDE_PATTERNS = ("is_retired",)
+DEFAULT_SPLINE_CATEGORICAL_EXCLUDE_PATTERNS = ("is_retired",)
+
+# Only parameters that plausibly change the curvature of consumption in liquid
+# wealth receive spline interactions.  Interacting every spline with every
+# metadata field created a large, weakly regularized basis and produced unstable
+# MPC derivatives in earlier versions.
+DEFAULT_SPLINE_PARAMETER_PATTERNS = (
+    "discount_factor",
+    "risk_aversion",
+    "borrowing_limit",
+    "borrowing_interest_rate",
+    "liquid_interest_rate",
+    "illiquid_interest_rate",
+    "innovation_std",
+    "persistence",
+    "job_loss_probability",
+    "job_finding_probability",
+    "unemployment_replacement_rate",
+    "ct_linear_adjustment_cost",
+    "ct_convex_adjustment_cost",
+    "ct_automatic_illiquid_income_share",
+)
+
 DEFAULT_CATEGORICAL_STATE_COLUMNS = (
     "education",
     "employment_state",
@@ -1446,7 +1946,6 @@ DEFAULT_MONETARY_COLUMNS = (
     "unemployment_benefits",
     "taxes",
     "labor_income_state",
-    "liquid_assets",
     "illiquid_assets",
     "total_assets",
     "cash_on_hand",
@@ -1456,10 +1955,25 @@ DEFAULT_MONETARY_COLUMNS = (
 @dataclass(frozen=True)
 class FeatureSpec:
     state_columns: tuple[str, ...] = DEFAULT_STATE_COLUMNS
+    engineered_state_columns: tuple[str, ...] = DEFAULT_ENGINEERED_STATE_COLUMNS
+    redundant_state_columns: tuple[str, ...] = DEFAULT_REDUNDANT_STATE_COLUMNS
     parameter_columns: tuple[str, ...] = ()
     categorical_state_columns: tuple[str, ...] = DEFAULT_CATEGORICAL_STATE_COLUMNS
     categorical_parameter_columns: tuple[str, ...] = ()
     signed_log_columns: tuple[str, ...] = DEFAULT_MONETARY_COLUMNS
+
+    @property
+    def continuous_state_columns(self) -> tuple[str, ...]:
+        """All primitive and engineered continuous states, including display-only."""
+
+        return tuple(dict.fromkeys(self.state_columns + self.engineered_state_columns))
+
+    @property
+    def model_state_columns(self) -> tuple[str, ...]:
+        """Continuous states actually supplied to the regression feature map."""
+
+        redundant = set(self.redundant_state_columns)
+        return tuple(c for c in self.continuous_state_columns if c not in redundant)
 
     @property
     def categorical_columns(self) -> tuple[str, ...]:
@@ -1471,15 +1985,19 @@ class FeatureSpec:
 
     @property
     def required_columns(self) -> tuple[str, ...]:
+        # These are the columns required by the encoder.  Primitive display-only
+        # states such as current_income are completed earlier by prepare_inputs.
         return tuple(
             dict.fromkeys(
-                self.state_columns + self.parameter_columns + self.categorical_columns
+                self.model_state_columns
+                + self.parameter_columns
+                + self.categorical_columns
             )
         )
 
 
 class StandardizedFeatureEncoder:
-    """Median imputation, asinh scaling for money variables, and one-hot coding."""
+    """Median imputation, selective asinh transforms, and one-hot coding."""
 
     def __init__(self, spec: FeatureSpec):
         self.spec = spec
@@ -1494,25 +2012,30 @@ class StandardizedFeatureEncoder:
         missing = [c for c in self.spec.required_columns if c not in X.columns]
         if missing:
             raise KeyError(f"Feature columns missing from training data: {missing}")
-        for col in self.spec.state_columns + self.spec.parameter_columns:
+
+        for col in self.spec.model_state_columns + self.spec.parameter_columns:
             values = pd.to_numeric(X[col], errors="coerce").to_numpy(dtype=float)
             finite = values[np.isfinite(values)]
             median = float(np.median(finite)) if len(finite) else 0.0
             values = np.where(np.isfinite(values), values, median)
             self.medians_[col] = median
+
             if col in self.spec.signed_log_columns:
                 nonzero = np.abs(values[np.abs(values) > EPS])
                 scale = float(np.median(nonzero)) if len(nonzero) else 1.0
                 scale = max(scale, EPS)
                 self.asinh_scales_[col] = scale
                 values = np.arcsinh(values / scale)
+
             mean = float(np.mean(values))
             std = float(np.std(values))
             self.means_[col] = mean
             self.stds_[col] = max(std, 1.0e-8)
+
         for col in self.spec.categorical_columns:
             values = X[col].where(X[col].notna(), "__missing__").astype(str)
             self.categories_[col] = sorted(values.unique().tolist())
+
         self.fitted_ = True
         return self
 
@@ -1537,7 +2060,8 @@ class StandardizedFeatureEncoder:
         missing = [c for c in self.spec.required_columns if c not in X.columns]
         if missing:
             raise KeyError(f"Feature columns missing at prediction time: {missing}")
-        state = self._numeric_block(X, self.spec.state_columns)
+
+        state = self._numeric_block(X, self.spec.model_state_columns)
         params = self._numeric_block(X, self.spec.parameter_columns)
 
         cat_blocks: list[np.ndarray] = []
@@ -1545,10 +2069,7 @@ class StandardizedFeatureEncoder:
         for col in self.spec.categorical_columns:
             values = X[col].where(X[col].notna(), "__missing__").astype(str).to_numpy()
             known = self.categories_[col]
-            # Use standard treatment coding: the first observed category is the
-            # baseline, and every remaining level receives a dummy.  This keeps
-            # the intercept and category-specific slopes full rank while still
-            # representing every category in the polynomial.
+            # Treatment coding: first observed level is the baseline.
             encoded = known[1:]
             block = np.zeros((len(X), len(encoded)), dtype=np.float32)
             lookup = {value: j for j, value in enumerate(encoded)}
@@ -1558,6 +2079,7 @@ class StandardizedFeatureEncoder:
                     block[i, j] = 1.0
             cat_blocks.append(block)
             cat_names.extend([f"{col}={value}" for value in encoded])
+
         cats = (
             np.concatenate(cat_blocks, axis=1)
             if cat_blocks
@@ -1570,8 +2092,20 @@ class StandardizedFeatureEncoder:
         return np.concatenate([state, params, cats], axis=1)
 
 
+def _matches_any_pattern(name: str, patterns: Sequence[str]) -> bool:
+    lower = str(name).lower()
+    return any(str(pattern).lower() in lower for pattern in patterns)
+
+
 class StructuredPolynomialMap:
-    """A controlled polynomial basis designed for HA policy functions."""
+    """Fully standardized polynomial, spline, and lifecycle tensor basis.
+
+    The crucial addition is a tensor-product spline between liquid slack and
+    years to the terminal age.  It lets the MPC vary smoothly over the remaining
+    horizon instead of imposing a nearly constant retiree MPC plus a discrete
+    retirement jump.  ``is_retired`` remains a level dummy but is excluded from
+    category-specific slopes and spline interactions by default.
+    """
 
     def __init__(
         self,
@@ -1582,53 +2116,220 @@ class StructuredPolynomialMap:
         state_parameter_interactions: bool = True,
         parameter_parameter_interactions: bool = False,
         categorical_slopes: bool = True,
+        categorical_slope_exclude_patterns: Sequence[str] = (
+            DEFAULT_CATEGORICAL_SLOPE_EXCLUDE_PATTERNS
+        ),
+        spline_columns: Sequence[str] = DEFAULT_SPLINE_COLUMNS,
+        spline_n_knots: int = 6,
+        spline_degree: int = 3,
+        spline_parameter_interactions: bool = True,
+        spline_categorical_interactions: bool = True,
+        spline_categorical_exclude_patterns: Sequence[str] = (
+            DEFAULT_SPLINE_CATEGORICAL_EXCLUDE_PATTERNS
+        ),
+        spline_parameter_patterns: Sequence[str] = DEFAULT_SPLINE_PARAMETER_PATTERNS,
+        spline_tensor_pairs: Sequence[tuple[str, str]] = DEFAULT_SPLINE_TENSOR_PAIRS,
+        final_standardize: bool = True,
+        scaler_sample_rows: int = 100_000,
+        random_state: int = 123,
     ):
         if degree not in {1, 2, 3, 4}:
             raise ValueError("degree must be 1, 2, 3, or 4")
+        if spline_n_knots < 4:
+            raise ValueError("spline_n_knots must be at least 4.")
+        if spline_degree < 1:
+            raise ValueError("spline_degree must be positive.")
+
         self.spec = spec
         self.degree = int(degree)
         self.state_state_interactions = bool(state_state_interactions)
         self.state_parameter_interactions = bool(state_parameter_interactions)
         self.parameter_parameter_interactions = bool(parameter_parameter_interactions)
         self.categorical_slopes = bool(categorical_slopes)
-        self.encoder = StandardizedFeatureEncoder(spec)
-        self.feature_names_: list[str] = []
+        self.categorical_slope_exclude_patterns = tuple(
+            categorical_slope_exclude_patterns
+        )
+        self.spline_columns = tuple(
+            col for col in spline_columns if col in spec.model_state_columns
+        )
+        self.spline_n_knots = int(spline_n_knots)
+        self.spline_degree = int(spline_degree)
+        self.spline_parameter_interactions = bool(spline_parameter_interactions)
+        self.spline_categorical_interactions = bool(spline_categorical_interactions)
+        self.spline_categorical_exclude_patterns = tuple(
+            spline_categorical_exclude_patterns
+        )
+        self.spline_parameter_patterns = tuple(spline_parameter_patterns)
+        self.spline_tensor_pairs = tuple(
+            (str(left), str(right)) for left, right in spline_tensor_pairs
+        )
+        self.final_standardize = bool(final_standardize)
+        self.scaler_sample_rows = int(max(1, scaler_sample_rows))
+        self.random_state = int(random_state)
 
-    def fit(self, X: pd.DataFrame) -> "StructuredPolynomialMap":
+        self.encoder = StandardizedFeatureEncoder(spec)
+        self.spline_transformers_: dict[str, SplineTransformer] = {}
+        self.spline_feature_names_: list[str] = []
+        self.spline_slices_: dict[str, slice] = {}
+        self.active_spline_tensor_pairs_: list[tuple[str, str]] = []
+        self.spline_parameter_indices_: np.ndarray = np.empty(0, dtype=np.int64)
+        self.categorical_slope_indices_: np.ndarray = np.empty(0, dtype=np.int64)
+        self.spline_categorical_indices_: np.ndarray = np.empty(0, dtype=np.int64)
+        self.raw_feature_names_: list[str] = []
+        self.feature_names_: list[str] = []
+        self.keep_mask_: np.ndarray | None = None
+        self.design_means_: np.ndarray | None = None
+        self.design_stds_: np.ndarray | None = None
+        self.fitted_: bool = False
+
+    def _raw_filled_column(self, X: pd.DataFrame, col: str) -> np.ndarray:
+        values = pd.to_numeric(X[col], errors="coerce").to_numpy(dtype=float)
+        median = float(self.encoder.medians_.get(col, 0.0))
+        return np.where(np.isfinite(values), values, median)[:, None]
+
+    def _fit_components(self, X: pd.DataFrame) -> None:
         self.encoder.fit(X)
         _, _, _, cat_names = self.encoder.transform_parts(X.iloc[:1])
-        s_names = list(self.spec.state_columns)
-        p_names = list(self.spec.parameter_columns)
-        names = s_names + p_names + cat_names
+        state_names = list(self.spec.model_state_columns)
+        parameter_names = list(self.spec.parameter_columns)
+
+        self.categorical_slope_indices_ = np.asarray(
+            [
+                i
+                for i, name in enumerate(cat_names)
+                if not _matches_any_pattern(
+                    name, self.categorical_slope_exclude_patterns
+                )
+            ],
+            dtype=np.int64,
+        )
+        categorical_slope_names = [
+            cat_names[i] for i in self.categorical_slope_indices_
+        ]
+        self.spline_categorical_indices_ = np.asarray(
+            [
+                i
+                for i, name in enumerate(cat_names)
+                if not _matches_any_pattern(
+                    name, self.spline_categorical_exclude_patterns
+                )
+            ],
+            dtype=np.int64,
+        )
+        spline_categorical_names = [
+            cat_names[i] for i in self.spline_categorical_indices_
+        ]
+
+        self.spline_transformers_ = {}
+        self.spline_feature_names_ = []
+        self.spline_slices_ = {}
+        for col in self.spline_columns:
+            values = self._raw_filled_column(X, col)
+            if np.unique(np.round(values.ravel(), 12)).size < 4:
+                continue
+            transformer = SplineTransformer(
+                n_knots=self.spline_n_knots,
+                degree=self.spline_degree,
+                knots="quantile",
+                extrapolation="linear",
+                include_bias=False,
+            )
+            transformer.fit(values)
+            names = transformer.get_feature_names_out([col]).tolist()
+            start = len(self.spline_feature_names_)
+            self.spline_transformers_[col] = transformer
+            self.spline_feature_names_.extend(names)
+            self.spline_slices_[col] = slice(start, start + len(names))
+
+        self.active_spline_tensor_pairs_ = [
+            (left, right)
+            for left, right in self.spline_tensor_pairs
+            if left in self.spline_slices_ and right in self.spline_slices_
+        ]
+
+        selected_parameter_indices = [
+            i
+            for i, name in enumerate(parameter_names)
+            if _matches_any_pattern(name, self.spline_parameter_patterns)
+            and not name.endswith("__missing")
+        ]
+        self.spline_parameter_indices_ = np.asarray(
+            selected_parameter_indices, dtype=np.int64
+        )
+        selected_parameter_names = [
+            parameter_names[i] for i in selected_parameter_indices
+        ]
+
+        names = state_names + parameter_names + cat_names
+        numeric_names = state_names + parameter_names
         if self.degree >= 2:
-            names += [f"{x}^2" for x in s_names + p_names]
+            names += [f"{x}^2" for x in numeric_names]
         if self.degree >= 3:
-            names += [f"{x}^3" for x in s_names + p_names]
+            names += [f"{x}^3" for x in numeric_names]
         if self.degree >= 4:
-            names += [f"{x}^4" for x in s_names + p_names]
+            names += [f"{x}^4" for x in numeric_names]
         if self.state_state_interactions:
             names += [
-                f"{s_names[i]}*{s_names[j]}"
-                for i in range(len(s_names))
-                for j in range(i + 1, len(s_names))
+                f"{state_names[i]}*{state_names[j]}"
+                for i in range(len(state_names))
+                for j in range(i + 1, len(state_names))
             ]
         if self.state_parameter_interactions:
-            names += [f"{s}*{p}" for s in s_names for p in p_names]
+            names += [f"{state}*{parameter}" for state in state_names for parameter in parameter_names]
         if self.parameter_parameter_interactions:
             names += [
-                f"{p_names[i]}*{p_names[j]}"
-                for i in range(len(p_names))
-                for j in range(i + 1, len(p_names))
+                f"{parameter_names[i]}*{parameter_names[j]}"
+                for i in range(len(parameter_names))
+                for j in range(i + 1, len(parameter_names))
             ]
         if self.categorical_slopes:
-            names += [f"{cat}*{x}" for cat in cat_names for x in s_names + p_names]
-        self.feature_names_ = names
-        return self
+            names += [
+                f"{category}*{state}"
+                for category in categorical_slope_names
+                for state in state_names
+            ]
 
-    def transform(self, X: pd.DataFrame) -> np.ndarray:
+        names += self.spline_feature_names_
+        if self.spline_parameter_interactions:
+            names += [
+                f"{spline}*{parameter}"
+                for spline in self.spline_feature_names_
+                for parameter in selected_parameter_names
+            ]
+        if self.spline_categorical_interactions:
+            names += [
+                f"{spline}*{category}"
+                for spline in self.spline_feature_names_
+                for category in spline_categorical_names
+            ]
+        for left, right in self.active_spline_tensor_pairs_:
+            left_names = self.spline_feature_names_[self.spline_slices_[left]]
+            right_names = self.spline_feature_names_[self.spline_slices_[right]]
+            names += [
+                f"tensor({left_name},{right_name})"
+                for left_name in left_names
+                for right_name in right_names
+            ]
+
+        self.raw_feature_names_ = names
+
+    def _spline_block(self, X: pd.DataFrame) -> np.ndarray:
+        blocks: list[np.ndarray] = []
+        for col, transformer in self.spline_transformers_.items():
+            blocks.append(
+                transformer.transform(self._raw_filled_column(X, col)).astype(
+                    np.float32, copy=False
+                )
+            )
+        if not blocks:
+            return np.empty((len(X), 0), dtype=np.float32)
+        return np.concatenate(blocks, axis=1)
+
+    def _raw_transform(self, X: pd.DataFrame) -> np.ndarray:
         state, params, cats, _ = self.encoder.transform_parts(X)
         numeric = np.concatenate([state, params], axis=1)
         blocks: list[np.ndarray] = [state, params, cats]
+
         if self.degree >= 2:
             blocks.append(numeric**2)
         if self.degree >= 3:
@@ -1642,16 +2343,102 @@ class StructuredPolynomialMap:
                 for j in range(i + 1, state.shape[1])
             )
         if self.state_parameter_interactions and params.shape[1] > 0:
-            blocks.append((state[:, :, None] * params[:, None, :]).reshape(len(X), -1))
+            blocks.append(
+                (state[:, :, None] * params[:, None, :]).reshape(len(X), -1)
+            )
         if self.parameter_parameter_interactions and params.shape[1] > 1:
             blocks.extend(
                 params[:, i : i + 1] * params[:, j : j + 1]
                 for i in range(params.shape[1])
                 for j in range(i + 1, params.shape[1])
             )
-        if self.categorical_slopes and cats.shape[1] > 0 and numeric.shape[1] > 0:
-            blocks.append((cats[:, :, None] * numeric[:, None, :]).reshape(len(X), -1))
-        return np.concatenate(blocks, axis=1).astype(np.float32, copy=False)
+        if (
+            self.categorical_slopes
+            and self.categorical_slope_indices_.size > 0
+            and state.shape[1] > 0
+        ):
+            selected_cats = cats[:, self.categorical_slope_indices_]
+            blocks.append(
+                (selected_cats[:, :, None] * state[:, None, :]).reshape(len(X), -1)
+            )
+
+        spline = self._spline_block(X)
+        if spline.shape[1] > 0:
+            blocks.append(spline)
+            if (
+                self.spline_parameter_interactions
+                and self.spline_parameter_indices_.size > 0
+            ):
+                selected_params = params[:, self.spline_parameter_indices_]
+                blocks.append(
+                    (spline[:, :, None] * selected_params[:, None, :]).reshape(
+                        len(X), -1
+                    )
+                )
+            if (
+                self.spline_categorical_interactions
+                and self.spline_categorical_indices_.size > 0
+            ):
+                selected_cats = cats[:, self.spline_categorical_indices_]
+                blocks.append(
+                    (spline[:, :, None] * selected_cats[:, None, :]).reshape(
+                        len(X), -1
+                    )
+                )
+            for left, right in self.active_spline_tensor_pairs_:
+                left_block = spline[:, self.spline_slices_[left]]
+                right_block = spline[:, self.spline_slices_[right]]
+                blocks.append(
+                    (left_block[:, :, None] * right_block[:, None, :]).reshape(
+                        len(X), -1
+                    )
+                )
+
+        raw = np.concatenate(blocks, axis=1).astype(np.float32, copy=False)
+        if raw.shape[1] != len(self.raw_feature_names_):
+            raise RuntimeError(
+                "Feature-name/design mismatch: "
+                f"{len(self.raw_feature_names_)} names for {raw.shape[1]} columns."
+            )
+        return raw
+
+    def fit(self, X: pd.DataFrame) -> "StructuredPolynomialMap":
+        self._fit_components(X)
+        if len(X) > self.scaler_sample_rows:
+            rng = np.random.default_rng(self.random_state)
+            positions = np.sort(
+                rng.choice(len(X), size=self.scaler_sample_rows, replace=False)
+            )
+            sample = X.iloc[positions]
+        else:
+            sample = X
+
+        raw = self._raw_transform(sample).astype(np.float64, copy=False)
+        finite = np.all(np.isfinite(raw), axis=0)
+        std = np.nanstd(raw, axis=0)
+        keep = finite & (std > 1.0e-10)
+        if not np.any(keep):
+            raise ValueError("The constructed design matrix has no varying columns.")
+
+        self.keep_mask_ = keep
+        kept = raw[:, keep]
+        self.design_means_ = np.mean(kept, axis=0)
+        self.design_stds_ = np.maximum(np.std(kept, axis=0), 1.0e-8)
+        self.feature_names_ = [
+            name for name, use in zip(self.raw_feature_names_, keep) if use
+        ]
+        self.fitted_ = True
+        return self
+
+    def transform(self, X: pd.DataFrame) -> np.ndarray:
+        if not self.fitted_ or self.keep_mask_ is None:
+            raise RuntimeError("Feature map is not fitted.")
+        raw = self._raw_transform(X)[:, self.keep_mask_].astype(np.float64, copy=False)
+        if self.final_standardize:
+            if self.design_means_ is None or self.design_stds_ is None:
+                raise RuntimeError("Final design scaler is not fitted.")
+            raw = (raw - self.design_means_) / self.design_stds_
+        return raw.astype(np.float32, copy=False)
 
     def fit_transform(self, X: pd.DataFrame) -> np.ndarray:
         return self.fit(X).transform(X)
@@ -1695,7 +2482,9 @@ class SmoothRFFMap:
             0.0, 2.0 * math.pi, size=self.n_components
         ).astype(np.float32)
         self.gamma_ = gamma
-        self.feature_names_ = [f"rbf_{i}" for i in range(self.n_components)]
+        self.feature_names_ = [
+            f"rbf_{i}" for i in range(self.n_components)
+        ]
         if self.include_linear:
             self.feature_names_ += [f"linear_{i}" for i in range(d)]
         return self
@@ -1708,7 +2497,9 @@ class SmoothRFFMap:
             Z @ self.random_weights_ + self.random_offset_
         )
         if self.include_linear:
-            return np.concatenate([rff, Z], axis=1).astype(np.float32, copy=False)
+            return np.concatenate([rff, Z], axis=1).astype(
+                np.float32, copy=False
+            )
         return rff.astype(np.float32, copy=False)
 
     def fit_transform(self, X: pd.DataFrame) -> np.ndarray:
@@ -1757,6 +2548,8 @@ class TargetTransform:
 
 
 PRIMITIVE_POLICY_TARGETS = ("consumption", "deposit")
+AUXILIARY_POLICY_TARGETS = ("liquid_outflow",)
+ALL_FIT_TARGETS = PRIMITIVE_POLICY_TARGETS + AUXILIARY_POLICY_TARGETS
 VALIDATION_TARGETS = (
     "consumption",
     "deposit",
@@ -1881,7 +2674,9 @@ def _accounting_defaults_from_data(data: pd.DataFrame) -> dict[str, Any]:
     out.setdefault("acct__chi1", 0.0)
     out.setdefault("acct__xi", 0.0)
     out.setdefault("acct__illiquid_cost_floor", 1.0e-6)
+    out.setdefault("acct__policy_drift_clip", 0.0)
     out.setdefault("acct__retirement_age", np.inf)
+    out.setdefault("acct__terminal_age", np.inf)
     out.setdefault("acct__tax_kind", "none")
     out.setdefault("acct__tax_flat_rate", 0.0)
     out.setdefault("acct__tax_deduction", 0.0)
@@ -1943,6 +2738,17 @@ def prepare_policy_inputs(
         accounting_defaults=accounting_defaults,
     )
 
+    # The economically relevant borrowing-constraint location moves with the
+    # selected borrowing limit.  Keep the reconstruction and engineered liquid
+    # slack aligned with that parameter rather than a stale sample median.
+    if "param__config__borrowing_limit" in out:
+        borrowing_limit = _numeric_column(
+            out,
+            "param__config__borrowing_limit",
+            default=float(default_values.get("liquid_grid_min", 0.0)),
+        )
+        out["liquid_grid_min"] = borrowing_limit
+
     # current_income is the gross income state used by the saved policy grids.
     if "current_income" not in out and "gross_income" in out:
         out["current_income"] = out["gross_income"]
@@ -1965,6 +2771,24 @@ def prepare_policy_inputs(
     retired = age >= retirement_age
     out["is_retired"] = retired.astype(int)
     out["years_to_retirement"] = retirement_age - age
+    out["years_to_retirement_positive"] = np.maximum(retirement_age - age, 0.0)
+    out["years_since_retirement"] = np.maximum(age - retirement_age, 0.0)
+
+    terminal_age = _resolve_numeric_input(
+        out,
+        candidates=("param__config__max_age", "terminal_age"),
+        accounting_column="acct__terminal_age",
+        accounting_defaults=accounting_defaults,
+    )
+    # Older inputs may not carry max_age.  The fitted bundle does, but this
+    # fallback keeps diagnostics on hand-built rows finite.
+    fallback_terminal = float(default_values.get("terminal_age", np.nan))
+    if not np.isfinite(fallback_terminal):
+        fallback_terminal = float(default_values.get("age", 0.0))
+    terminal_age = np.where(np.isfinite(terminal_age), terminal_age, fallback_terminal)
+    terminal_age = np.maximum(terminal_age, age)
+    out["terminal_age"] = terminal_age
+    out["years_to_terminal"] = np.maximum(terminal_age - age, 0.0)
 
     employment_state = _numeric_column(
         out,
@@ -2061,11 +2885,113 @@ def prepare_policy_inputs(
         liquid = pd.to_numeric(out["liquid_assets"], errors="coerce")
         out["cash_on_hand"] = liquid + after_tax
 
+    # MPC-oriented engineered states.  Permanent labor-income capacity is the
+    # natural scale variable in the parametric HA model.  Liquid slack aligns
+    # borrowing constraints across models with different debt limits.
+    liquid = _numeric_column(
+        out,
+        "liquid_assets",
+        default=float(default_values.get("liquid_assets", 0.0)),
+    )
+    illiquid = _numeric_column(
+        out,
+        "illiquid_assets",
+        default=float(default_values.get("illiquid_assets", 0.0)),
+    )
+    liquid_min = _numeric_column(
+        out,
+        "liquid_grid_min",
+        default=float(default_values.get("liquid_grid_min", 0.0)),
+    )
+    permanent_income = _numeric_column(
+        out,
+        "labor_income_state",
+        default=float(default_values.get("labor_income_state", 1.0)),
+    )
+    default_income = abs(float(default_values.get("labor_income_state", 1.0)))
+    income_floor = max(1.0e-6, 1.0e-3 * default_income)
+    income_scale = np.maximum(np.abs(permanent_income), income_floor)
+
+    liquid_slack = liquid - liquid_min
+    out["liquid_slack"] = liquid_slack
+    out["liquid_assets_to_income"] = liquid / income_scale
+    out["liquid_slack_to_income"] = liquid_slack / income_scale
+    out["illiquid_assets_to_income"] = illiquid / income_scale
+    out["after_tax_income_to_income"] = after_tax / income_scale
+    out["cash_on_hand_to_income"] = (liquid + after_tax) / income_scale
+
     # Restore any still-missing feature columns after the accounting update.
     for column in feature_spec.required_columns:
         if column not in out:
             out[column] = default_values.get(column, "__missing__")
     return out
+
+
+def _transfer_use_from_deposit(
+    deposit: np.ndarray,
+    illiquid_assets: np.ndarray,
+    *,
+    chi0: np.ndarray,
+    chi1: np.ndarray,
+    a_floor: np.ndarray,
+) -> np.ndarray:
+    """Return d + adjustment_cost(d,a), the liquid-resource use of a transfer."""
+
+    d = np.asarray(deposit, dtype=float)
+    a = np.asarray(illiquid_assets, dtype=float)
+    floor = np.maximum(np.asarray(a_floor, dtype=float), EPS)
+    return (
+        d
+        + np.asarray(chi0, dtype=float) * np.abs(d)
+        + 0.5
+        * np.asarray(chi1, dtype=float)
+        * d**2
+        / np.maximum(a, floor)
+    )
+
+
+def _deposit_from_transfer_use(
+    transfer_use: np.ndarray,
+    illiquid_assets: np.ndarray,
+    *,
+    chi0: np.ndarray,
+    chi1: np.ndarray,
+    a_floor: np.ndarray,
+) -> np.ndarray:
+    """Invert d + chi(d,a) on the solver's economically admissible branch.
+
+    The map is monotone on the deposit interval selected by the HJB first-order
+    condition.  Positive resource use maps to deposits and negative resource use
+    maps to withdrawals.  Predictions below the feasible withdrawal minimum are
+    projected to that minimum rather than generating complex roots.
+    """
+
+    u = np.asarray(transfer_use, dtype=float)
+    a = np.asarray(illiquid_assets, dtype=float)
+    chi0_arr = np.asarray(chi0, dtype=float)
+    chi1_arr = np.maximum(np.asarray(chi1, dtype=float), EPS)
+    floor = np.maximum(np.asarray(a_floor, dtype=float), EPS)
+    a_eff = np.maximum(a, floor)
+
+    positive = u >= 0.0
+    B = np.where(positive, 1.0 + chi0_arr, 1.0 - chi0_arr)
+    B = np.maximum(B, EPS)
+    A = 0.5 * chi1_arr / a_eff
+
+    # On the withdrawal branch the minimum feasible transfer use is attained
+    # where 1-chi0 + chi1*d/a = 0.
+    u_min = -(B**2) / np.maximum(4.0 * A, EPS)
+    u_feasible = np.where(positive, u, np.maximum(u, u_min))
+    discriminant = np.maximum(B**2 + 4.0 * A * u_feasible, 0.0)
+
+    quadratic = (-B + np.sqrt(discriminant)) / np.maximum(2.0 * A, EPS)
+    linear = u_feasible / B
+    d = np.where(A > 1.0e-12, quadratic, linear)
+
+    lower = -(1.0 - chi0_arr) * a_eff / chi1_arr
+    d = np.where(positive, np.maximum(d, 0.0), np.minimum(d, 0.0))
+    d = np.maximum(d, lower)
+    return d
 
 
 def reconstruct_policy_outputs(
@@ -2075,9 +3001,22 @@ def reconstruct_policy_outputs(
     accounting_defaults: Mapping[str, Any],
     money_units: str,
     output_bounds: Mapping[str, tuple[float, float]] | None = None,
+    liquid_outflow_weight: float = 0.0,
     project: bool = True,
 ) -> pd.DataFrame:
-    """Enforce the HA model's accounting identities exactly."""
+    """Reconcile smooth policy predictions and enforce the HA accounting system.
+
+    Consumption and deposit are fitted directly.  A third auxiliary regression
+    predicts total liquid outflow,
+
+        q = c + d + adjustment_cost(d,a),
+
+    because q determines liquid saving one-for-one.  The selected reconciliation
+    weight blends direct q with the q implied by the direct deposit prediction,
+    then analytically recovers an accounting-consistent deposit.  A weight of
+    zero reproduces the old consumption/deposit system; a weight of one uses the
+    direct liquid-outflow fit.
+    """
 
     if "liquid_assets" not in X or "illiquid_assets" not in X:
         raise KeyError(
@@ -2086,17 +3025,17 @@ def reconstruct_policy_outputs(
     if "after_tax_income" not in X:
         raise KeyError("Accounting reconstruction requires after_tax_income.")
     if not set(PRIMITIVE_POLICY_TARGETS).issubset(primitive_predictions.columns):
-        raise KeyError("Primitive predictions must contain consumption and deposit.")
+        raise KeyError("Predictions must contain consumption and deposit.")
 
     b = pd.to_numeric(X["liquid_assets"], errors="coerce").to_numpy(dtype=float)
     a = pd.to_numeric(X["illiquid_assets"], errors="coerce").to_numpy(dtype=float)
     y = pd.to_numeric(X["after_tax_income"], errors="coerce").to_numpy(dtype=float)
-    c = pd.to_numeric(primitive_predictions["consumption"], errors="coerce").to_numpy(
-        dtype=float
-    )
-    d = pd.to_numeric(primitive_predictions["deposit"], errors="coerce").to_numpy(
-        dtype=float
-    )
+    c = pd.to_numeric(
+        primitive_predictions["consumption"], errors="coerce"
+    ).to_numpy(dtype=float)
+    d_direct = pd.to_numeric(
+        primitive_predictions["deposit"], errors="coerce"
+    ).to_numpy(dtype=float)
     if project:
         c = np.maximum(c, 0.0)
 
@@ -2180,12 +3119,64 @@ def reconstruct_policy_outputs(
         )
     a_floor = np.maximum(a_floor, EPS)
 
-    adjustment_cost = chi0 * np.abs(d) + 0.5 * chi1 * d**2 / np.maximum(a, a_floor)
+    transfer_use_direct = _transfer_use_from_deposit(
+        d_direct,
+        a,
+        chi0=chi0,
+        chi1=chi1,
+        a_floor=a_floor,
+    )
+    q_from_direct_deposit = c + transfer_use_direct
+
+    weight = float(np.clip(liquid_outflow_weight, 0.0, 1.0))
+    if "liquid_outflow" in primitive_predictions and weight > 0.0:
+        q_direct = pd.to_numeric(
+            primitive_predictions["liquid_outflow"], errors="coerce"
+        ).to_numpy(dtype=float)
+        q_target = weight * q_direct + (1.0 - weight) * q_from_direct_deposit
+    else:
+        q_direct = q_from_direct_deposit.copy()
+        q_target = q_from_direct_deposit
+
+    d = _deposit_from_transfer_use(
+        q_target - c,
+        a,
+        chi0=chi0,
+        chi1=chi1,
+        a_floor=a_floor,
+    )
+    transfer_use = _transfer_use_from_deposit(
+        d,
+        a,
+        chi0=chi0,
+        chi1=chi1,
+        a_floor=a_floor,
+    )
+    q = c + transfer_use
+    adjustment_cost = transfer_use - d
+
     liquid_return = np.where(b >= 0.0, rb_pos * b, rb_neg * b)
-    liquid_drift = (1.0 - xi) * y + liquid_return - d - adjustment_cost - c
+    liquid_resources = (1.0 - xi) * y + liquid_return
+    liquid_drift = liquid_resources - q
     illiquid_drift = ra * a + xi * y + d
-    next_b_unclipped = b + dt * liquid_drift
-    next_a_unclipped = a + dt * illiquid_drift
+
+    drift_clip = _resolve_numeric_input(
+        X,
+        candidates=("param__config__ct_policy_drift_clip",),
+        accounting_column="acct__policy_drift_clip",
+        accounting_defaults=accounting_defaults,
+    )
+    finite_clip = np.isfinite(drift_clip) & (drift_clip > 0.0)
+    liquid_drift = np.where(
+        finite_clip,
+        np.minimum(np.maximum(liquid_drift, -drift_clip), drift_clip),
+        liquid_drift,
+    )
+    illiquid_drift = np.where(
+        finite_clip,
+        np.minimum(np.maximum(illiquid_drift, -drift_clip), drift_clip),
+        illiquid_drift,
+    )
 
     if output_bounds is None:
         output_bounds = {}
@@ -2202,6 +3193,25 @@ def reconstruct_policy_outputs(
     ill_lo = _numeric_column(X, "illiquid_grid_min", default=ill_default[0])
     ill_hi = _numeric_column(X, "illiquid_grid_max", default=ill_default[1])
 
+    # Match the original solver's state constraints before forming annual
+    # transitions.  This also makes the reported drifts agree with exact grids.
+    b_tol = 1.0e-10 * np.maximum(1.0, np.maximum(np.abs(liq_lo), np.abs(liq_hi)))
+    a_tol = 1.0e-10 * np.maximum(1.0, np.maximum(np.abs(ill_lo), np.abs(ill_hi)))
+    liquid_drift = np.where(
+        b <= liq_lo + b_tol, np.maximum(liquid_drift, 0.0), liquid_drift
+    )
+    liquid_drift = np.where(
+        b >= liq_hi - b_tol, np.minimum(liquid_drift, 0.0), liquid_drift
+    )
+    illiquid_drift = np.where(
+        a <= ill_lo + a_tol, np.maximum(illiquid_drift, 0.0), illiquid_drift
+    )
+    illiquid_drift = np.where(
+        a >= ill_hi - a_tol, np.minimum(illiquid_drift, 0.0), illiquid_drift
+    )
+
+    next_b_unclipped = b + dt * liquid_drift
+    next_a_unclipped = a + dt * illiquid_drift
     if project:
         next_b = np.minimum(np.maximum(next_b_unclipped, liq_lo), liq_hi)
         next_a = np.minimum(np.maximum(next_a_unclipped, ill_lo), ill_hi)
@@ -2212,6 +3222,9 @@ def reconstruct_policy_outputs(
     out = pd.DataFrame(index=X.index)
     out["consumption"] = c
     out["deposit"] = d
+    out["deposit_direct"] = d_direct
+    out["liquid_outflow"] = q
+    out["liquid_outflow_direct"] = q_direct
     out["adjustment_cost"] = adjustment_cost
     out["liquid_drift"] = liquid_drift
     out["illiquid_drift"] = illiquid_drift
@@ -2221,7 +3234,9 @@ def reconstruct_policy_outputs(
     out["next_illiquid_assets"] = next_a
     out["delta_liquid_assets"] = next_b - b
     out["delta_illiquid_assets"] = next_a - a
-    out["liquid_asset_projection_binding"] = np.abs(next_b - next_b_unclipped) > 1.0e-10
+    out["liquid_asset_projection_binding"] = (
+        np.abs(next_b - next_b_unclipped) > 1.0e-10
+    )
     out["illiquid_asset_projection_binding"] = (
         np.abs(next_a - next_a_unclipped) > 1.0e-10
     )
@@ -2231,7 +3246,7 @@ def reconstruct_policy_outputs(
 @dataclass
 class PolicySurrogateBundle:
     feature_map: Any
-    regressions: dict[str, Ridge]
+    regressions: dict[str, Any]
     feature_spec: FeatureSpec
     internal_targets: tuple[str, ...]
     target_transforms: dict[str, TargetTransform]
@@ -2243,6 +3258,7 @@ class PolicySurrogateBundle:
     validation_metrics: pd.DataFrame
     validation_by_model: pd.DataFrame
     training_metadata: dict[str, Any]
+    liquid_outflow_weight: float = 0.0
 
     def prepare_inputs(self, X: pd.DataFrame) -> pd.DataFrame:
         money_units = str(self.training_metadata.get("money_units", "model"))
@@ -2276,6 +3292,7 @@ class PolicySurrogateBundle:
             accounting_defaults=self.accounting_defaults,
             money_units=money_units,
             output_bounds=self.output_bounds,
+            liquid_outflow_weight=float(self.liquid_outflow_weight),
             project=project,
         )
 
@@ -2299,11 +3316,13 @@ class PolicySurrogateBundle:
                 "surrogate. Retrain it with the accounting-restricted code."
             )
         version = int(value.training_metadata.get("bundle_format_version", 0))
-        if version != 2:
+        if version != 6:
             raise TypeError(
-                "This bundle predates the final categorical treatment-coding "
-                "format. Retrain it with the current code."
+                "This bundle predates the lifecycle-aware MPC feature format. "
+                "Retrain it with the current code."
             )
+        if not hasattr(value, "liquid_outflow_weight"):
+            value.liquid_outflow_weight = 0.0
         return value
 
 
@@ -2312,7 +3331,7 @@ def _feature_range_summary(
     spec: FeatureSpec,
 ) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
-    for col in spec.state_columns + spec.parameter_columns:
+    for col in spec.continuous_state_columns + spec.parameter_columns:
         x = pd.to_numeric(data[col], errors="coerce")
         finite = x[np.isfinite(x)]
         if finite.empty:
@@ -2350,7 +3369,7 @@ def _default_row(
     accounting_defaults: Mapping[str, Any],
 ) -> dict[str, Any]:
     row: dict[str, Any] = {}
-    for col in spec.state_columns + spec.parameter_columns:
+    for col in spec.continuous_state_columns + spec.parameter_columns:
         x = pd.to_numeric(data[col], errors="coerce")
         row[col] = float(x.median()) if x.notna().any() else 0.0
     for col in spec.categorical_columns:
@@ -2369,22 +3388,604 @@ def _default_row(
     return row
 
 
-def _target_transform_kind(target: str) -> str:
-    return "log1p" if target == "consumption" else "asinh"
+def _target_transform_kind(
+    target: str,
+    *,
+    consumption_transform: str,
+    deposit_transform: str,
+    liquid_outflow_transform: str,
+) -> str:
+    if target == "consumption":
+        return consumption_transform
+    if target == "deposit":
+        return deposit_transform
+    if target == "liquid_outflow":
+        return liquid_outflow_transform
+    raise KeyError(f"Unknown fitted target {target!r}.")
 
 
 def _primitive_predictions_from_models(
     feature_map: Any,
-    regressions: Mapping[str, Ridge],
+    regressions: Mapping[str, Any],
     transforms: Mapping[str, TargetTransform],
     X: pd.DataFrame,
 ) -> pd.DataFrame:
     Z = feature_map.transform(X)
     out: dict[str, np.ndarray] = {}
-    for target in PRIMITIVE_POLICY_TARGETS:
+    for target in regressions:
+        if target not in transforms:
+            continue
         pred_t = np.asarray(regressions[target].predict(Z), dtype=float)
         out[target] = transforms[target].inverse(pred_t)
     return pd.DataFrame(out, index=X.index)
+
+
+
+def _paired_mpc_table(
+    data: pd.DataFrame,
+    predicted_consumption: np.ndarray | pd.Series | None = None,
+) -> pd.DataFrame:
+    """Return exact/predicted MPCs and baseline lifecycle states for each pair."""
+
+    required = {"model_id", "mpc_pair_id", "mpc_pair_role", "mpc_check_units", "consumption"}
+    if not required.issubset(data.columns):
+        return pd.DataFrame()
+
+    frame = data.reset_index(drop=True)
+    pair_id = pd.to_numeric(frame["mpc_pair_id"], errors="coerce").to_numpy(dtype=float)
+    role = pd.to_numeric(frame["mpc_pair_role"], errors="coerce").to_numpy(dtype=float)
+    check = pd.to_numeric(frame["mpc_check_units"], errors="coerce").to_numpy(dtype=float)
+    exact = pd.to_numeric(frame["consumption"], errors="coerce").to_numpy(dtype=float)
+
+    valid = (
+        np.isfinite(pair_id)
+        & (pair_id >= 0)
+        & np.isin(role, [0.0, 1.0])
+        & np.isfinite(check)
+        & (check > EPS)
+        & np.isfinite(exact)
+    )
+    if not valid.any():
+        return pd.DataFrame()
+
+    if predicted_consumption is None:
+        predicted = np.full(len(frame), np.nan, dtype=float)
+    else:
+        predicted = pd.to_numeric(
+            pd.Series(predicted_consumption), errors="coerce"
+        ).to_numpy(dtype=float)
+        if len(predicted) != len(frame):
+            raise ValueError("predicted_consumption has the wrong length.")
+
+    temp_data: dict[str, Any] = {
+        "row_position": np.arange(len(frame), dtype=np.int64),
+        "model_id": frame["model_id"].astype(str),
+        "pair_id": pair_id.astype(np.int64),
+        "role": role.astype(np.int8),
+        "check": check,
+        "exact_consumption": exact,
+        "predicted_consumption": predicted,
+    }
+    for column in (
+        "age",
+        "is_retired",
+        "years_to_terminal",
+        "years_since_retirement",
+        "liquid_slack_to_income",
+    ):
+        if column in frame:
+            temp_data[column] = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+
+    temp = pd.DataFrame(temp_data).loc[valid]
+    keys = ["model_id", "pair_id"]
+    baseline = temp[temp["role"] == 0].set_index(keys)
+    treated = temp[temp["role"] == 1].set_index(keys)
+    common = baseline.index.intersection(treated.index)
+    if len(common) == 0:
+        return pd.DataFrame()
+
+    baseline = baseline.loc[common]
+    treated = treated.loc[common]
+    pair_check = 0.5 * (
+        baseline["check"].to_numpy(dtype=float)
+        + treated["check"].to_numpy(dtype=float)
+    )
+    good = np.isfinite(pair_check) & (pair_check > EPS)
+
+    out_data: dict[str, Any] = {
+        "model_id": [idx[0] for idx in common],
+        "pair_id": [idx[1] for idx in common],
+        "baseline_position": baseline["row_position"].to_numpy(dtype=np.int64),
+        "treated_position": treated["row_position"].to_numpy(dtype=np.int64),
+        "check_units": pair_check,
+        "exact_mpc": (
+            treated["exact_consumption"].to_numpy(dtype=float)
+            - baseline["exact_consumption"].to_numpy(dtype=float)
+        ) / pair_check,
+        "predicted_mpc": (
+            treated["predicted_consumption"].to_numpy(dtype=float)
+            - baseline["predicted_consumption"].to_numpy(dtype=float)
+        ) / pair_check,
+    }
+    for column in (
+        "age",
+        "is_retired",
+        "years_to_terminal",
+        "years_since_retirement",
+        "liquid_slack_to_income",
+    ):
+        if column in baseline:
+            out_data[column] = baseline[column].to_numpy(dtype=float)
+
+    return pd.DataFrame(out_data).loc[good].reset_index(drop=True)
+
+
+@dataclass
+class MPCPairDesign:
+    """Finite-difference feature rows and exact MPC targets.
+
+    ``difference`` contains
+
+        (Z_treated - Z_baseline) / check
+
+    for baseline/treated states that differ only in liquid assets.  The design
+    is constructed after the final polynomial/spline basis has been
+    standardized, so its columns are on comparable scales.
+    """
+
+    difference: np.ndarray
+    target: np.ndarray
+    checks: np.ndarray
+    model_ids: np.ndarray
+    n_available: int
+
+    @property
+    def n_pairs(self) -> int:
+        return int(len(self.target))
+
+
+def _balanced_indices_within_block(
+    block: pd.DataFrame,
+    *,
+    n_take: int,
+    rng: np.random.Generator,
+) -> list[int]:
+    """Select evenly across retirement, age, and liquid-wealth cells."""
+
+    if n_take >= len(block):
+        return block.index.astype(int).tolist()
+    if n_take <= 0:
+        return []
+
+    strata = [
+        np.asarray(values, dtype=np.int64).copy()
+        for values in block.groupby("__mpc_stratum", sort=False).groups.values()
+    ]
+    for values in strata:
+        rng.shuffle(values)
+
+    selected: list[int] = []
+    cursor = 0
+    # Round-robin sampling prevents a common lifecycle cell from using the
+    # entire model quota before terminal-age or retiree cells are represented.
+    while len(selected) < n_take and strata:
+        next_strata = []
+        for values in strata:
+            if cursor < len(values):
+                selected.append(int(values[cursor]))
+                if len(selected) == n_take:
+                    break
+            if cursor + 1 < len(values):
+                next_strata.append(values)
+        cursor += 1
+        if not next_strata and len(selected) < n_take:
+            remaining = np.asarray(
+                [i for i in block.index if int(i) not in set(selected)],
+                dtype=np.int64,
+            )
+            if len(remaining):
+                extra = rng.choice(
+                    remaining,
+                    size=min(n_take - len(selected), len(remaining)),
+                    replace=False,
+                )
+                selected.extend(int(i) for i in extra)
+            break
+        strata = next_strata
+    return selected[:n_take]
+
+
+def _stratified_pair_subsample(
+    pairs: pd.DataFrame,
+    *,
+    max_pairs: int | None,
+    random_state: int,
+    age_bins: Sequence[float] = (45.0, 65.0, 70.0, 75.0),
+    liquid_bins: int = 4,
+) -> pd.DataFrame:
+    """Subsample pairs by model × lifecycle region × liquid-wealth region."""
+
+    if pairs.empty:
+        return pairs.copy()
+
+    work = pairs.reset_index(drop=True).copy()
+    age_edges = [-np.inf, *sorted(float(x) for x in age_bins), np.inf]
+    age_values = pd.to_numeric(
+        work["age"] if "age" in work else pd.Series(np.nan, index=work.index),
+        errors="coerce",
+    )
+    work["__age_bin"] = pd.cut(
+        age_values,
+        bins=age_edges,
+        labels=False,
+        include_lowest=True,
+    ).fillna(-1).astype(int)
+    retired = pd.to_numeric(
+        work["is_retired"]
+        if "is_retired" in work
+        else pd.Series(np.nan, index=work.index),
+        errors="coerce",
+    ).fillna(-1).astype(int)
+    work["__retired"] = retired
+
+    liquid = pd.to_numeric(
+        work["liquid_slack_to_income"]
+        if "liquid_slack_to_income" in work
+        else pd.Series(np.nan, index=work.index),
+        errors="coerce",
+    )
+    finite_liquid = liquid[np.isfinite(liquid)]
+    if int(liquid_bins) > 1 and len(finite_liquid) >= int(liquid_bins):
+        quantiles = np.unique(
+            np.quantile(finite_liquid, np.linspace(0.0, 1.0, int(liquid_bins) + 1))
+        )
+        if len(quantiles) >= 3:
+            quantiles[0] = -np.inf
+            quantiles[-1] = np.inf
+            work["__liquid_bin"] = pd.cut(
+                liquid,
+                bins=quantiles,
+                labels=False,
+                include_lowest=True,
+                duplicates="drop",
+            ).fillna(-1).astype(int)
+        else:
+            work["__liquid_bin"] = 0
+    else:
+        work["__liquid_bin"] = 0
+
+    work["__mpc_stratum"] = list(
+        zip(work["__retired"], work["__age_bin"], work["__liquid_bin"])
+    )
+
+    if max_pairs is None or max_pairs <= 0 or len(work) <= int(max_pairs):
+        return work.drop(columns=[c for c in work if c.startswith("__")]).reset_index(drop=True)
+
+    limit = int(max_pairs)
+    rng = np.random.default_rng(int(random_state))
+    model_groups = list(work.groupby("model_id", sort=False))
+    n_models = len(model_groups)
+    if n_models == 0:
+        return work.iloc[:0].copy()
+
+    if n_models >= limit:
+        chosen = rng.choice(np.arange(n_models), size=limit, replace=False)
+        selected = []
+        for position in chosen:
+            _, block = model_groups[int(position)]
+            selected.extend(_balanced_indices_within_block(block, n_take=1, rng=rng))
+    else:
+        base_quota = limit // n_models
+        remainder = limit % n_models
+        order = rng.permutation(n_models)
+        bonus = set(order[:remainder].tolist())
+        selected = []
+        for position, (_, block) in enumerate(model_groups):
+            quota = base_quota + (1 if position in bonus else 0)
+            selected.extend(
+                _balanced_indices_within_block(
+                    block,
+                    n_take=min(quota, len(block)),
+                    rng=rng,
+                )
+            )
+
+        if len(selected) < limit:
+            selected_set = set(selected)
+            remaining = np.asarray(
+                [i for i in work.index if int(i) not in selected_set],
+                dtype=np.int64,
+            )
+            if len(remaining):
+                extra = rng.choice(
+                    remaining,
+                    size=min(limit - len(selected), len(remaining)),
+                    replace=False,
+                )
+                selected.extend(int(i) for i in extra)
+
+    selected = sorted(set(selected))[:limit]
+    return (
+        work.loc[selected]
+        .drop(columns=[c for c in work if c.startswith("__")])
+        .reset_index(drop=True)
+    )
+
+
+def _build_mpc_pair_design(
+    data: pd.DataFrame,
+    Z: np.ndarray,
+    *,
+    max_pairs: int | None,
+    random_state: int,
+    trim_quantile: float = 0.0,
+    age_bins: Sequence[float] = (45.0, 65.0, 70.0, 75.0),
+    liquid_bins: int = 4,
+) -> MPCPairDesign | None:
+    """Construct standardized finite-difference rows for the MPC objective."""
+
+    pairs = _paired_mpc_table(data)
+    if pairs.empty:
+        return None
+
+    n_available = int(len(pairs))
+    pairs = _stratified_pair_subsample(
+        pairs,
+        max_pairs=max_pairs,
+        random_state=random_state,
+        age_bins=age_bins,
+        liquid_bins=liquid_bins,
+    )
+
+    baseline = pairs['baseline_position'].to_numpy(dtype=np.int64)
+    treated = pairs['treated_position'].to_numpy(dtype=np.int64)
+    checks = pairs['check_units'].to_numpy(dtype=float)
+    targets = pairs['exact_mpc'].to_numpy(dtype=float)
+
+    valid = (
+        (baseline >= 0)
+        & (treated >= 0)
+        & (baseline < len(Z))
+        & (treated < len(Z))
+        & np.isfinite(checks)
+        & (checks > EPS)
+        & np.isfinite(targets)
+    )
+    baseline = baseline[valid]
+    treated = treated[valid]
+    checks = checks[valid]
+    targets = targets[valid]
+    model_ids = pairs.loc[valid, 'model_id'].astype(str).to_numpy(dtype=object)
+
+    q = float(trim_quantile)
+    if q < 0.0 or q >= 0.5:
+        raise ValueError('mpc_objective_trim_quantile must be in [0, 0.5).')
+    if q > 0.0 and len(targets) >= 100:
+        lo, hi = np.quantile(targets, [q, 1.0 - q])
+        keep = (targets >= lo) & (targets <= hi)
+        baseline = baseline[keep]
+        treated = treated[keep]
+        checks = checks[keep]
+        targets = targets[keep]
+        model_ids = model_ids[keep]
+
+    if len(targets) == 0:
+        return None
+
+    difference = (
+        Z[treated].astype(np.float64, copy=False)
+        - Z[baseline].astype(np.float64, copy=False)
+    ) / checks[:, None]
+    finite = np.isfinite(targets) & np.all(np.isfinite(difference), axis=1)
+    if not finite.any():
+        return None
+
+    return MPCPairDesign(
+        difference=difference[finite].astype(np.float32, copy=False),
+        target=targets[finite].astype(np.float64, copy=False),
+        checks=checks[finite].astype(np.float64, copy=False),
+        model_ids=model_ids[finite],
+        n_available=n_available,
+    )
+
+
+@dataclass
+class JointConsumptionMPCRegressor:
+    """Ridge regression fitted jointly to consumption levels and exact MPCs.
+
+    The estimator minimizes
+
+        sum_i (c_i - intercept - Z_i beta)^2
+        + w * N/P * sum_p (mpc_p - D_p beta)^2
+        + alpha * ||beta||^2,
+
+    where ``D_p = (Z_treated - Z_baseline) / check``.  The intercept cancels
+    from the MPC equations and is never ridge-penalized.  A matrix-free LSMR
+    solve avoids copying the full level design matrix when derivative rows are
+    added.
+    """
+
+    alpha: float
+    mpc_weight: float
+    max_iter: int = 200
+    tol: float = 1.0e-6
+    coef_: np.ndarray | None = None
+    intercept_: float | None = None
+    solver_diagnostics_: dict[str, Any] = field(default_factory=dict)
+
+    def fit(
+        self,
+        Z: np.ndarray,
+        y: np.ndarray,
+        pair_design: MPCPairDesign,
+    ) -> 'JointConsumptionMPCRegressor':
+        Z_arr = np.asarray(Z, dtype=np.float32)
+        y_arr = np.asarray(y, dtype=np.float64)
+        if Z_arr.ndim != 2 or len(y_arr) != len(Z_arr):
+            raise ValueError('Z and y have incompatible dimensions.')
+        if pair_design is None or pair_design.n_pairs == 0:
+            raise ValueError('Joint MPC fitting requires at least one valid pair.')
+        if self.alpha < 0.0 or self.mpc_weight <= 0.0:
+            raise ValueError('alpha must be nonnegative and mpc_weight positive.')
+        if self.max_iter <= 0 or self.tol <= 0.0:
+            raise ValueError('max_iter and tol must be positive.')
+
+        D = np.asarray(pair_design.difference, dtype=np.float32)
+        m = np.asarray(pair_design.target, dtype=np.float64)
+        if D.ndim != 2 or D.shape[1] != Z_arr.shape[1] or len(D) != len(m):
+            raise ValueError('MPC pair design has incompatible dimensions.')
+
+        n_level, n_features = Z_arr.shape
+        n_pairs = len(m)
+        z_mean = np.mean(Z_arr, axis=0, dtype=np.float64)
+        y_mean = float(np.mean(y_arr))
+        y_centered = y_arr - y_mean
+
+        # Scale the pair block so mpc_weight compares average MPC loss with
+        # average level loss and does not depend on how many pair rows happen
+        # to be sampled.
+        pair_scale = math.sqrt(float(self.mpc_weight) * n_level / n_pairs)
+
+        def matvec(beta: np.ndarray) -> np.ndarray:
+            beta = np.asarray(beta, dtype=np.float64)
+            centered_level = Z_arr @ beta - float(z_mean @ beta)
+            pair_values = pair_scale * (D @ beta)
+            return np.concatenate([centered_level, pair_values])
+
+        def rmatvec(values: np.ndarray) -> np.ndarray:
+            values = np.asarray(values, dtype=np.float64)
+            level_values = values[:n_level]
+            pair_values = values[n_level:]
+            level_part = Z_arr.T @ level_values - z_mean * float(level_values.sum())
+            pair_part = pair_scale * (D.T @ pair_values)
+            return np.asarray(level_part + pair_part, dtype=np.float64)
+
+        operator = LinearOperator(
+            shape=(n_level + n_pairs, n_features),
+            matvec=matvec,
+            rmatvec=rmatvec,
+            dtype=np.float64,
+        )
+        rhs = np.concatenate([y_centered, pair_scale * m])
+        solution = lsmr(
+            operator,
+            rhs,
+            damp=math.sqrt(float(self.alpha)),
+            atol=float(self.tol),
+            btol=float(self.tol),
+            maxiter=int(self.max_iter),
+        )
+
+        coef = np.asarray(solution[0], dtype=np.float64)
+        self.coef_ = coef
+        self.intercept_ = float(y_mean - z_mean @ coef)
+        self.solver_diagnostics_ = {
+            'istop': int(solution[1]),
+            'iterations': int(solution[2]),
+            'residual_norm': float(solution[3]),
+            'normal_residual_norm': float(solution[4]),
+            'operator_norm': float(solution[5]),
+            'condition_number': float(solution[6]),
+            'coefficient_norm': float(solution[7]),
+            'n_level_rows': int(n_level),
+            'n_mpc_pairs': int(n_pairs),
+            'mpc_pairs_available': int(pair_design.n_available),
+            'mpc_weight': float(self.mpc_weight),
+            'alpha': float(self.alpha),
+        }
+        return self
+
+    def predict(self, Z: np.ndarray) -> np.ndarray:
+        if self.coef_ is None or self.intercept_ is None:
+            raise RuntimeError('The joint consumption/MPC regressor is not fitted.')
+        return float(self.intercept_) + np.asarray(Z, dtype=np.float64) @ self.coef_
+
+    def predict_mpc(
+        self,
+        Z_baseline: np.ndarray,
+        Z_treated: np.ndarray,
+        check_sizes: np.ndarray,
+    ) -> np.ndarray:
+        if self.coef_ is None:
+            raise RuntimeError('The joint consumption/MPC regressor is not fitted.')
+        checks = np.asarray(check_sizes, dtype=np.float64)
+        if np.any(~np.isfinite(checks)) or np.any(checks <= 0.0):
+            raise ValueError('check_sizes must be finite and positive.')
+        difference = (
+            np.asarray(Z_treated, dtype=np.float64)
+            - np.asarray(Z_baseline, dtype=np.float64)
+        ) / checks[:, None]
+        return difference @ self.coef_
+
+
+def _fit_consumption_regressor(
+    Z: np.ndarray,
+    y: np.ndarray,
+    *,
+    alpha: float,
+    mpc_weight: float,
+    pair_design: MPCPairDesign | None,
+    max_iter: int,
+    tol: float,
+) -> Any:
+    """Fit ordinary ridge or the joint level/MPC estimator."""
+
+    if float(mpc_weight) <= 0.0 or pair_design is None or pair_design.n_pairs == 0:
+        model = Ridge(alpha=float(alpha), fit_intercept=True, solver='lsqr')
+        model.fit(Z, y)
+        return model
+
+    model = JointConsumptionMPCRegressor(
+        alpha=float(alpha),
+        mpc_weight=float(mpc_weight),
+        max_iter=int(max_iter),
+        tol=float(tol),
+    )
+    model.fit(Z, y, pair_design)
+    return model
+
+
+def _mpc_metric_row_from_pairs(
+    data: pd.DataFrame,
+    pred: pd.DataFrame,
+    *,
+    split: str,
+    model_id: str | None = None,
+) -> dict[str, Any] | None:
+    pairs = _paired_mpc_table(data, pred["consumption"].to_numpy(dtype=float))
+    if model_id is not None:
+        pairs = pairs[pairs["model_id"].astype(str) == str(model_id)]
+    if pairs.empty:
+        return None
+
+    exact = pairs["exact_mpc"].to_numpy(dtype=float)
+    predicted = pairs["predicted_mpc"].to_numpy(dtype=float)
+    ok = np.isfinite(exact) & np.isfinite(predicted)
+    exact, predicted = exact[ok], predicted[ok]
+    if len(exact) == 0:
+        return None
+
+    mse = float(np.mean((predicted - exact) ** 2))
+    rmse = math.sqrt(mse)
+    sd = float(np.std(exact))
+    row: dict[str, Any] = {
+        "split": split,
+        "target": "mpc",
+        "n": int(len(exact)),
+        "rmse": rmse,
+        "nrmse_sd": float(rmse / max(sd, EPS)),
+        "mae": float(np.mean(np.abs(predicted - exact))),
+        "r2": float(r2_score(exact, predicted)) if len(exact) > 1 else np.nan,
+        "bias": float(np.mean(predicted - exact)),
+        "benchmark": None,
+        "benchmark_rmse": np.nan,
+        "benchmark_r2": np.nan,
+        "rmse_relative_to_benchmark": np.nan,
+        "skill_vs_benchmark": np.nan,
+    }
+    if model_id is not None:
+        row["model_id"] = str(model_id)
+    return row
 
 
 def _benchmark_prediction(
@@ -2478,6 +4079,9 @@ def _metrics_table(
         row = _single_metric_row(truth, pred, target=target, split=split)
         if row is not None:
             rows.append(row)
+    mpc_row = _mpc_metric_row_from_pairs(truth, pred, split=split)
+    if mpc_row is not None:
+        rows.append(mpc_row)
     return pd.DataFrame(rows)
 
 
@@ -2500,6 +4104,14 @@ def _metrics_by_model(
             )
             if row is not None:
                 rows.append(row)
+        mpc_row = _mpc_metric_row_from_pairs(
+            truth,
+            predicted,
+            split=split,
+            model_id=str(model_id),
+        )
+        if mpc_row is not None:
+            rows.append(mpc_row)
     return pd.DataFrame(rows)
 
 
@@ -2563,15 +4175,47 @@ def _normalize_target_parameterization(value: str) -> str:
     )
 
 
+def _relative_rmse(
+    truth: np.ndarray | pd.Series,
+    predicted: np.ndarray | pd.Series,
+    *,
+    benchmark: np.ndarray | pd.Series | None = None,
+) -> float:
+    """RMSE relative to a natural benchmark scale."""
+
+    y = pd.to_numeric(pd.Series(truth), errors="coerce").to_numpy(dtype=float)
+    p = pd.to_numeric(pd.Series(predicted), errors="coerce").to_numpy(dtype=float)
+    ok = np.isfinite(y) & np.isfinite(p)
+    if not ok.any():
+        return np.inf
+    y = y[ok]
+    p = p[ok]
+    rmse = float(np.sqrt(np.mean((p - y) ** 2)))
+    if benchmark is None:
+        scale = float(np.std(y))
+    else:
+        b = pd.to_numeric(pd.Series(benchmark), errors="coerce").to_numpy(dtype=float)
+        b = b[ok]
+        scale = float(np.sqrt(np.mean((b - y) ** 2)))
+    return rmse / max(scale, EPS)
+
+
 def fit_policy_surrogate(
     data: pd.DataFrame,
     *,
     parameter_columns: Sequence[str],
     categorical_parameter_columns: Sequence[str] = (),
     state_columns: Sequence[str] = DEFAULT_STATE_COLUMNS,
+    engineered_state_columns: Sequence[str] = DEFAULT_ENGINEERED_STATE_COLUMNS,
+    redundant_state_columns: Sequence[str] = DEFAULT_REDUNDANT_STATE_COLUMNS,
     categorical_columns: Sequence[str] = DEFAULT_CATEGORICAL_STATE_COLUMNS,
     model_type: str = "polynomial",
     polynomial_degree: int = 2,
+    spline_columns: Sequence[str] = DEFAULT_SPLINE_COLUMNS,
+    spline_n_knots: int = 6,
+    spline_tensor_pairs: Sequence[tuple[str, str]] = DEFAULT_SPLINE_TENSOR_PAIRS,
+    categorical_slope_exclude_patterns: Sequence[str] = DEFAULT_CATEGORICAL_SLOPE_EXCLUDE_PATTERNS,
+    spline_categorical_exclude_patterns: Sequence[str] = DEFAULT_SPLINE_CATEGORICAL_EXCLUDE_PATTERNS,
     rff_components: int = 512,
     ridge_alphas: Sequence[float] = (
         1.0e-4,
@@ -2583,6 +4227,29 @@ def fit_policy_surrogate(
         100.0,
     ),
     target_parameterization: str = "accounting",
+    consumption_transform: str = "identity",
+    deposit_transform: str = "asinh",
+    liquid_outflow_transform: str = "identity",
+    mpc_loss_weight: float = 1.0,
+    mpc_difference_weight: float | None = None,
+    mpc_difference_weight_grid: Sequence[float] = (
+        0.0,
+        0.05,
+        0.10,
+        0.25,
+        0.50,
+        1.0,
+        2.0,
+    ),
+    mpc_objective_max_pairs: int | None = 250_000,
+    mpc_objective_max_iter: int = 200,
+    mpc_objective_tol: float = 1.0e-6,
+    mpc_objective_trim_quantile: float = 0.0,
+    mpc_stratify_age_bins: Sequence[float] = (45.0, 65.0, 70.0, 75.0),
+    mpc_stratify_liquid_bins: int = 4,
+    liquid_change_loss_weight: float = 1.0,
+    deposit_reconciliation_loss_weight: float = 0.50,
+    liquid_outflow_weight: float | None = None,
     money_units: str = "model",
     validation_share: float = 0.20,
     tuning_share: float = 0.20,
@@ -2590,14 +4257,58 @@ def fit_policy_surrogate(
     verbose: bool = True,
     show_progress: bool = True,
 ) -> PolicySurrogateBundle:
-    """Fit and validate a smooth, accounting-restricted policy surrogate."""
+    """Fit and validate a smooth, accounting-restricted policy surrogate.
+
+    Consumption is estimated from a joint objective containing ordinary
+    consumption-level errors and exact finite-difference MPC errors.  The MPC
+    weight is either fixed by ``mpc_difference_weight`` or selected on tuning
+    models from ``mpc_difference_weight_grid``.  Deposit and total liquid
+    outflow retain ordinary ridge fits, and all reported asset policies remain
+    accounting-consistent.
+    """
 
     target_parameterization = _normalize_target_parameterization(
         target_parameterization
     )
+    valid_transforms = {"identity", "asinh", "log1p"}
+    for name, value in {
+        "consumption_transform": consumption_transform,
+        "deposit_transform": deposit_transform,
+        "liquid_outflow_transform": liquid_outflow_transform,
+    }.items():
+        if value not in valid_transforms:
+            raise ValueError(f"Unsupported {name}={value!r}.")
+
+    if mpc_loss_weight < 0.0:
+        raise ValueError("mpc_loss_weight must be nonnegative.")
+    if liquid_change_loss_weight < 0.0 or deposit_reconciliation_loss_weight < 0.0:
+        raise ValueError("Reconciliation loss weights must be nonnegative.")
+    if mpc_difference_weight is not None and float(mpc_difference_weight) < 0.0:
+        raise ValueError("mpc_difference_weight must be nonnegative.")
+    candidate_mpc_weights = (
+        [float(mpc_difference_weight)]
+        if mpc_difference_weight is not None
+        else sorted({float(x) for x in mpc_difference_weight_grid})
+    )
+    if not candidate_mpc_weights or any(x < 0.0 for x in candidate_mpc_weights):
+        raise ValueError("MPC difference weights must be a nonempty nonnegative grid.")
+    if consumption_transform != "identity" and any(x > 0.0 for x in candidate_mpc_weights):
+        raise ValueError(
+            "Direct MPC targeting requires --consumption-transform identity."
+        )
+    if mpc_objective_max_pairs is not None and int(mpc_objective_max_pairs) <= 0:
+        raise ValueError("mpc_objective_max_pairs must be positive or None.")
+    if int(mpc_objective_max_iter) <= 0 or float(mpc_objective_tol) <= 0.0:
+        raise ValueError("MPC objective solver controls must be positive.")
+    if not 0.0 <= float(mpc_objective_trim_quantile) < 0.5:
+        raise ValueError("mpc_objective_trim_quantile must be in [0, 0.5).")
+    if int(mpc_stratify_liquid_bins) < 1:
+        raise ValueError("mpc_stratify_liquid_bins must be at least one.")
+
     required_targets = {
         "consumption",
         "deposit",
+        "liquid_outflow",
         "next_liquid_assets",
         "next_illiquid_assets",
         "delta_liquid_assets",
@@ -2614,6 +4325,7 @@ def fit_policy_surrogate(
         f"{data['model_id'].nunique():,} solved parameterizations...",
         verbose=verbose,
     )
+
     parameters = tuple(parameter_columns)
     categorical_parameters = tuple(categorical_parameter_columns)
     missing_params = [c for c in parameters + categorical_parameters if c not in data]
@@ -2625,17 +4337,25 @@ def fit_policy_surrogate(
     )
     spec = FeatureSpec(
         state_columns=tuple(state_columns),
+        engineered_state_columns=tuple(engineered_state_columns),
+        redundant_state_columns=tuple(redundant_state_columns),
         parameter_columns=parameters + missing_indicators,
         categorical_state_columns=tuple(categorical_columns),
         categorical_parameter_columns=categorical_parameters,
+        # Liquid assets and normalized slack enter in levels.  Other monetary
+        # stocks/flows retain robust asinh scaling.
         signed_log_columns=tuple(
-            c for c in DEFAULT_MONETARY_COLUMNS if c in set(state_columns)
+            c
+            for c in DEFAULT_MONETARY_COLUMNS
+            if c in set(state_columns) and c != "liquid_assets"
         ),
     )
 
     accounting_defaults = _accounting_defaults_from_data(data)
     initial_defaults: dict[str, Any] = {}
-    for column in spec.state_columns + spec.parameter_columns:
+    for column in spec.continuous_state_columns + spec.parameter_columns:
+        if column not in data:
+            continue
         values = pd.to_numeric(data[column], errors="coerce")
         initial_defaults[column] = (
             float(values.median()) if values.notna().any() else 0.0
@@ -2656,10 +4376,6 @@ def fit_policy_surrogate(
             )
     initial_defaults.update(accounting_defaults)
 
-    # Accounting columns vary row by row when the underlying parameters vary;
-    # prepare_policy_inputs therefore uses row values first and defaults only as
-    # fallbacks.  Monetary deductions/floors are converted consistently with the
-    # units selected by GridSchema.
     if money_units not in {"model", "data"}:
         raise ValueError("money_units must be 'model' or 'data'.")
 
@@ -2673,6 +4389,7 @@ def fit_policy_surrogate(
     feature_missing = [c for c in spec.required_columns if c not in fit_data]
     if feature_missing:
         raise KeyError(f"Feature columns missing from data: {feature_missing}")
+
     finite_target = np.ones(len(fit_data), dtype=bool)
     for target in required_targets - {"model_id"}:
         finite_target &= np.isfinite(
@@ -2746,6 +4463,12 @@ def fit_policy_surrogate(
         )
         train = development.iloc[train_rel].copy()
         tune = development.iloc[tune_rel].copy()
+
+    train = train.reset_index(drop=True)
+    tune = tune.reset_index(drop=True)
+    test = test.reset_index(drop=True)
+    development = pd.concat([train, tune], axis=0, ignore_index=True)
+
     _status(
         "  model split: "
         f"train={train['model_id'].nunique():,}, "
@@ -2761,8 +4484,21 @@ def fit_policy_surrogate(
                 degree=polynomial_degree,
                 state_state_interactions=True,
                 state_parameter_interactions=True,
-                parameter_parameter_interactions=True,
+                parameter_parameter_interactions=False,
                 categorical_slopes=True,
+                categorical_slope_exclude_patterns=tuple(
+                    categorical_slope_exclude_patterns
+                ),
+                spline_columns=tuple(spline_columns),
+                spline_n_knots=int(spline_n_knots),
+                spline_degree=3,
+                spline_parameter_interactions=True,
+                spline_categorical_interactions=True,
+                spline_categorical_exclude_patterns=tuple(
+                    spline_categorical_exclude_patterns
+                ),
+                spline_tensor_pairs=tuple(spline_tensor_pairs),
+                random_state=random_state,
             )
         if model_type in {"rff", "rbf"}:
             return SmoothRFFMap(
@@ -2773,8 +4509,8 @@ def fit_policy_surrogate(
         raise ValueError("model_type must be 'polynomial' or 'rff'.")
 
     _status(
-        f"[fit 2/6] Constructing {model_type} features for target-specific "
-        "ridge tuning...",
+        f"[fit 2/6] Constructing standardized {model_type} features for "
+        "target-specific ridge tuning...",
         verbose=verbose,
     )
     feature_start = time.perf_counter()
@@ -2787,108 +4523,315 @@ def fit_policy_surrogate(
         verbose=verbose,
     )
 
+    train_mpc_design = _build_mpc_pair_design(
+        train,
+        Z_train,
+        max_pairs=mpc_objective_max_pairs,
+        random_state=random_state + 11,
+        trim_quantile=mpc_objective_trim_quantile,
+        age_bins=mpc_stratify_age_bins,
+        liquid_bins=mpc_stratify_liquid_bins,
+    )
+    if any(weight > 0.0 for weight in candidate_mpc_weights):
+        if train_mpc_design is None:
+            raise ValueError(
+                "Direct MPC targeting was requested, but no valid training pairs "
+                "were constructed. Increase --mpc-pair-share and rows per model."
+            )
+        _status(
+            f"  direct MPC objective: {train_mpc_design.n_pairs:,} pairs "
+            f"({train_mpc_design.n_available:,} available before the cap)",
+            verbose=verbose,
+        )
+
+    target_transform_names = {
+        target: _target_transform_kind(
+            target,
+            consumption_transform=consumption_transform,
+            deposit_transform=deposit_transform,
+            liquid_outflow_transform=liquid_outflow_transform,
+        )
+        for target in ALL_FIT_TARGETS
+    }
+    tuning_transforms: dict[str, TargetTransform] = {}
+    y_train_transformed: dict[str, np.ndarray] = {}
+    y_tune_levels: dict[str, np.ndarray] = {}
+    for target in ALL_FIT_TARGETS:
+        transform = TargetTransform(target_transform_names[target]).fit(
+            pd.to_numeric(train[target], errors="coerce").to_numpy(dtype=float)
+        )
+        tuning_transforms[target] = transform
+        y_train_transformed[target] = transform.transform(
+            pd.to_numeric(train[target], errors="coerce").to_numpy(dtype=float)
+        )
+        y_tune_levels[target] = pd.to_numeric(
+            tune[target], errors="coerce"
+        ).to_numpy(dtype=float)
+
     _status(
-        f"[fit 3/6] Tuning separate ridge penalties for "
-        f"{len(PRIMITIVE_POLICY_TARGETS)} primitive policies...",
+        f"[fit 3/6] Tuning ridge penalties and the direct MPC objective...",
         verbose=verbose,
     )
     alpha_rows: list[dict[str, Any]] = []
     best_alphas: dict[str, float] = {}
-    tuning_transforms: dict[str, TargetTransform] = {}
-    tasks = [
-        (target, float(alpha))
-        for target in PRIMITIVE_POLICY_TARGETS
-        for alpha in ridge_alphas
-    ]
+    best_direct_mpc_weights: dict[str, float] = {
+        target: 0.0 for target in ALL_FIT_TARGETS
+    }
+    best_scores = {target: np.inf for target in ALL_FIT_TARGETS}
+
+    tasks: list[tuple[str, float, float]] = []
+    for target in ALL_FIT_TARGETS:
+        weights = candidate_mpc_weights if target == 'consumption' else [0.0]
+        for alpha in ridge_alphas:
+            for direct_weight in weights:
+                tasks.append((target, float(alpha), float(direct_weight)))
+
     iterator = _progress_iter(
         tasks,
         total=len(tasks),
-        description="Ridge tuning",
-        unit="fit",
+        description='Ridge/MPC tuning',
+        unit='fit',
         enabled=show_progress,
     )
-    target_best_score = {target: np.inf for target in PRIMITIVE_POLICY_TARGETS}
-    target_y_train: dict[str, np.ndarray] = {}
-    target_y_tune: dict[str, np.ndarray] = {}
-    for target in PRIMITIVE_POLICY_TARGETS:
-        transform = TargetTransform(_target_transform_kind(target)).fit(
-            pd.to_numeric(train[target], errors="coerce").to_numpy(dtype=float)
-        )
-        tuning_transforms[target] = transform
-        target_y_train[target] = transform.transform(
-            pd.to_numeric(train[target], errors="coerce").to_numpy(dtype=float)
-        )
-        target_y_tune[target] = pd.to_numeric(tune[target], errors="coerce").to_numpy(
-            dtype=float
-        )
 
-    for position, (target, alpha) in enumerate(iterator, start=1):
-        model = Ridge(alpha=alpha, fit_intercept=True, solver="lsqr")
-        model.fit(Z_train, target_y_train[target])
+    for position, (target, alpha, direct_weight) in enumerate(iterator, start=1):
+        if target == 'consumption':
+            model = _fit_consumption_regressor(
+                Z_train,
+                y_train_transformed[target],
+                alpha=alpha,
+                mpc_weight=direct_weight,
+                pair_design=train_mpc_design,
+                max_iter=mpc_objective_max_iter,
+                tol=mpc_objective_tol,
+            )
+        else:
+            model = Ridge(alpha=alpha, fit_intercept=True, solver='lsqr')
+            model.fit(Z_train, y_train_transformed[target])
+
         pred_t = np.asarray(model.predict(Z_tune), dtype=float)
         pred = tuning_transforms[target].inverse(pred_t)
-        truth = target_y_tune[target]
-        ok = np.isfinite(truth) & np.isfinite(pred)
-        rmse = float(np.sqrt(np.mean((pred[ok] - truth[ok]) ** 2)))
-        sd = float(np.std(truth[ok]))
-        score = rmse / max(sd, EPS)
+        truth = y_tune_levels[target]
+        level_nrmse = _relative_rmse(truth, pred)
+        combined_score = level_nrmse
+        mpc_rmse = np.nan
+        mpc_nrmse = np.nan
+        mpc_bias = np.nan
+        mpc_r2 = np.nan
+        n_mpc_pairs = 0
+
+        if target == 'consumption':
+            pairs = _paired_mpc_table(tune, pred)
+            if not pairs.empty:
+                exact_mpc = pairs['exact_mpc'].to_numpy(dtype=float)
+                predicted_mpc = pairs['predicted_mpc'].to_numpy(dtype=float)
+                ok = np.isfinite(exact_mpc) & np.isfinite(predicted_mpc)
+                if ok.any():
+                    errors = predicted_mpc[ok] - exact_mpc[ok]
+                    mpc_rmse = float(np.sqrt(np.mean(errors**2)))
+                    mpc_sd = float(np.std(exact_mpc[ok]))
+                    mpc_nrmse = mpc_rmse / max(mpc_sd, EPS)
+                    mpc_bias = float(np.mean(errors))
+                    mpc_r2 = (
+                        float(r2_score(exact_mpc[ok], predicted_mpc[ok]))
+                        if int(ok.sum()) > 1
+                        else np.nan
+                    )
+                    n_mpc_pairs = int(ok.sum())
+                    combined_score = (
+                        level_nrmse
+                        + float(mpc_loss_weight) * mpc_nrmse
+                        + 0.10 * abs(mpc_bias) / max(mpc_sd, EPS)
+                    )
+
+        solver_info = getattr(model, 'solver_diagnostics_', {}) or {}
         alpha_rows.append(
             {
-                "target": target,
-                "alpha": alpha,
-                "tuning_rmse": rmse,
-                "tuning_nrmse_sd": score,
+                'target': target,
+                'alpha': alpha,
+                'mpc_difference_weight': direct_weight,
+                'tuning_nrmse_sd': level_nrmse,
+                'tuning_mpc_rmse': mpc_rmse,
+                'tuning_mpc_nrmse': mpc_nrmse,
+                'tuning_mpc_bias': mpc_bias,
+                'tuning_mpc_r2': mpc_r2,
+                'tuning_score': combined_score,
+                'n_mpc_tuning_pairs': n_mpc_pairs,
+                'joint_solver_iterations': solver_info.get('iterations'),
+                'joint_solver_stop_code': solver_info.get('istop'),
             }
         )
-        if score < target_best_score[target]:
-            target_best_score[target] = score
+        if combined_score < best_scores[target]:
+            best_scores[target] = combined_score
             best_alphas[target] = alpha
+            best_direct_mpc_weights[target] = direct_weight
+
         if verbose and (_tqdm is None or not show_progress):
             _status(
                 f"  {position}/{len(tasks)}: target={target}; alpha={alpha:g}; "
-                f"NRMSE={score:.5f}",
+                f"direct MPC weight={direct_weight:g}; score={combined_score:.5f}",
                 verbose=verbose,
             )
         elif show_progress and _tqdm is not None:
             iterator.set_postfix(  # type: ignore[attr-defined]
                 target=target,
-                alpha=f"{alpha:g}",
-                score=f"{score:.4f}",
+                alpha=f'{alpha:g}',
+                mpc_w=f'{direct_weight:g}',
+                score=f'{combined_score:.4f}',
             )
-    for target in PRIMITIVE_POLICY_TARGETS:
+
+    for target in ALL_FIT_TARGETS:
+        suffix = (
+            f", direct MPC weight={best_direct_mpc_weights[target]:g}"
+            if target == 'consumption'
+            else ''
+        )
         _status(
-            f"  selected {target} alpha={best_alphas[target]:g} "
-            f"(tuning NRMSE={target_best_score[target]:.5f})",
+            f"  selected {target} alpha={best_alphas[target]:g}{suffix} "
+            f"(tuning score={best_scores[target]:.5f})",
             verbose=verbose,
         )
 
+    # Fit the selected target models on the coefficient-training split and use
+    # the tuning split to choose how much the accounting reconciliation should
+    # trust direct liquid outflow versus direct deposit.
+    tuning_regressions: dict[str, Any] = {}
+    for target in ALL_FIT_TARGETS:
+        if target == "consumption":
+            model = _fit_consumption_regressor(
+                Z_train,
+                y_train_transformed[target],
+                alpha=best_alphas[target],
+                mpc_weight=best_direct_mpc_weights[target],
+                pair_design=train_mpc_design,
+                max_iter=mpc_objective_max_iter,
+                tol=mpc_objective_tol,
+            )
+        else:
+            model = Ridge(
+                alpha=best_alphas[target],
+                fit_intercept=True,
+                solver="lsqr",
+            )
+            model.fit(Z_train, y_train_transformed[target])
+        tuning_regressions[target] = model
+    tuning_internal = _primitive_predictions_from_models(
+        tuning_map,
+        tuning_regressions,
+        tuning_transforms,
+        tune,
+    )
+
+    if liquid_outflow_weight is None:
+        weight_grid = np.linspace(0.0, 1.0, 9)
+    else:
+        if not 0.0 <= float(liquid_outflow_weight) <= 1.0:
+            raise ValueError("liquid_outflow_weight must be in [0,1].")
+        weight_grid = np.array([float(liquid_outflow_weight)])
+
+    reconciliation_rows: list[dict[str, float]] = []
+    selected_outflow_weight = float(weight_grid[0])
+    best_reconciliation_score = np.inf
+    tuning_bounds = {
+        "next_liquid_assets": (
+            float(fit_data["liquid_grid_min"].min()),
+            float(fit_data["liquid_grid_max"].max()),
+        ),
+        "next_illiquid_assets": (
+            float(fit_data["illiquid_grid_min"].min()),
+            float(fit_data["illiquid_grid_max"].max()),
+        ),
+    }
+    for weight in weight_grid:
+        reconciled = reconstruct_policy_outputs(
+            tune,
+            tuning_internal,
+            accounting_defaults=accounting_defaults,
+            money_units=money_units,
+            output_bounds=tuning_bounds,
+            liquid_outflow_weight=float(weight),
+            project=True,
+        )
+        deposit_relative = _relative_rmse(
+            tune["deposit"],
+            reconciled["deposit"],
+            benchmark=np.zeros(len(tune)),
+        )
+        liquid_change_relative = _relative_rmse(
+            tune["delta_liquid_assets"],
+            reconciled["delta_liquid_assets"],
+            benchmark=np.zeros(len(tune)),
+        )
+        score = (
+            float(deposit_reconciliation_loss_weight) * deposit_relative
+            + float(liquid_change_loss_weight) * liquid_change_relative
+        )
+        reconciliation_rows.append(
+            {
+                "liquid_outflow_weight": float(weight),
+                "deposit_relative_rmse": deposit_relative,
+                "delta_liquid_relative_rmse": liquid_change_relative,
+                "score": score,
+            }
+        )
+        if score < best_reconciliation_score:
+            best_reconciliation_score = score
+            selected_outflow_weight = float(weight)
+
     _status(
-        "[fit 4/6] Refitting on training+tuning models and evaluating all "
-        "primitive and accounting-derived policies on held-out models...",
+        f"  selected liquid-outflow reconciliation weight="
+        f"{selected_outflow_weight:.3f} "
+        f"(tuning score={best_reconciliation_score:.5f})",
+        verbose=verbose,
+    )
+
+    _status(
+        "[fit 4/6] Refitting on training+tuning models and evaluating held-out "
+        "parameterizations...",
         verbose=verbose,
     )
     evaluation_start = time.perf_counter()
-    development = pd.concat([train, tune], axis=0).sort_index()
     evaluation_map = make_feature_map()
     Z_development = evaluation_map.fit_transform(development)
-    evaluation_regressions: dict[str, Ridge] = {}
+    development_mpc_design = _build_mpc_pair_design(
+        development,
+        Z_development,
+        max_pairs=mpc_objective_max_pairs,
+        random_state=random_state + 12,
+        trim_quantile=mpc_objective_trim_quantile,
+        age_bins=mpc_stratify_age_bins,
+        liquid_bins=mpc_stratify_liquid_bins,
+    )
+    evaluation_regressions: dict[str, Any] = {}
     evaluation_transforms: dict[str, TargetTransform] = {}
-    for target in PRIMITIVE_POLICY_TARGETS:
-        transform = TargetTransform(_target_transform_kind(target)).fit(
+    for target in ALL_FIT_TARGETS:
+        transform = TargetTransform(target_transform_names[target]).fit(
             pd.to_numeric(development[target], errors="coerce").to_numpy(dtype=float)
         )
         y = transform.transform(
             pd.to_numeric(development[target], errors="coerce").to_numpy(dtype=float)
         )
-        model = Ridge(
-            alpha=best_alphas[target],
-            fit_intercept=True,
-            solver="lsqr",
-        )
-        model.fit(Z_development, y)
+        if target == "consumption":
+            model = _fit_consumption_regressor(
+                Z_development,
+                y,
+                alpha=best_alphas[target],
+                mpc_weight=best_direct_mpc_weights[target],
+                pair_design=development_mpc_design,
+                max_iter=mpc_objective_max_iter,
+                tol=mpc_objective_tol,
+            )
+        else:
+            model = Ridge(
+                alpha=best_alphas[target],
+                fit_intercept=True,
+                solver="lsqr",
+            )
+            model.fit(Z_development, y)
         evaluation_regressions[target] = model
         evaluation_transforms[target] = transform
-    primitive_test = _primitive_predictions_from_models(
+
+    internal_test = _primitive_predictions_from_models(
         evaluation_map,
         evaluation_regressions,
         evaluation_transforms,
@@ -2896,19 +4839,11 @@ def fit_policy_surrogate(
     )
     test_pred = reconstruct_policy_outputs(
         test,
-        primitive_test,
+        internal_test,
         accounting_defaults=accounting_defaults,
         money_units=money_units,
-        output_bounds={
-            "next_liquid_assets": (
-                float(fit_data["liquid_grid_min"].min()),
-                float(fit_data["liquid_grid_max"].max()),
-            ),
-            "next_illiquid_assets": (
-                float(fit_data["illiquid_grid_min"].min()),
-                float(fit_data["illiquid_grid_max"].max()),
-            ),
-        },
+        output_bounds=tuning_bounds,
+        liquid_outflow_weight=selected_outflow_weight,
         project=True,
     )
     validation_metrics = _metrics_table(test, test_pred, "held_out_test_models")
@@ -2934,28 +4869,48 @@ def fit_policy_surrogate(
             )
 
     _status(
-        "[fit 5/6] Constructing the full design matrix and fitting the final "
-        "consumption and deposit surrogates...",
+        "[fit 5/6] Constructing the full design matrix and fitting final smooth "
+        "targets...",
         verbose=verbose,
     )
     final_start = time.perf_counter()
     final_map = make_feature_map()
     Z_all = final_map.fit_transform(fit_data)
-    final_regressions: dict[str, Ridge] = {}
+    final_mpc_design = _build_mpc_pair_design(
+        fit_data,
+        Z_all,
+        max_pairs=mpc_objective_max_pairs,
+        random_state=random_state + 13,
+        trim_quantile=mpc_objective_trim_quantile,
+        age_bins=mpc_stratify_age_bins,
+        liquid_bins=mpc_stratify_liquid_bins,
+    )
+    final_regressions: dict[str, Any] = {}
     final_transforms: dict[str, TargetTransform] = {}
-    for target in PRIMITIVE_POLICY_TARGETS:
-        transform = TargetTransform(_target_transform_kind(target)).fit(
+    for target in ALL_FIT_TARGETS:
+        transform = TargetTransform(target_transform_names[target]).fit(
             pd.to_numeric(fit_data[target], errors="coerce").to_numpy(dtype=float)
         )
         y = transform.transform(
             pd.to_numeric(fit_data[target], errors="coerce").to_numpy(dtype=float)
         )
-        model = Ridge(
-            alpha=best_alphas[target],
-            fit_intercept=True,
-            solver="lsqr",
-        )
-        model.fit(Z_all, y)
+        if target == "consumption":
+            model = _fit_consumption_regressor(
+                Z_all,
+                y,
+                alpha=best_alphas[target],
+                mpc_weight=best_direct_mpc_weights[target],
+                pair_design=final_mpc_design,
+                max_iter=mpc_objective_max_iter,
+                tol=mpc_objective_tol,
+            )
+        else:
+            model = Ridge(
+                alpha=best_alphas[target],
+                fit_intercept=True,
+                solver="lsqr",
+            )
+            model.fit(Z_all, y)
         final_regressions[target] = model
         final_transforms[target] = transform
     _status(
@@ -2972,6 +4927,7 @@ def fit_policy_surrogate(
         for target in (
             "consumption",
             "deposit",
+            "liquid_outflow",
             "next_liquid_assets",
             "next_illiquid_assets",
         )
@@ -2986,12 +4942,47 @@ def fit_policy_surrogate(
     ]
     defaults = _default_row(fit_data, spec, accounting_defaults)
     metadata = {
-        "bundle_format_version": 2,
+        "bundle_format_version": 6,
         "model_type": model_type,
         "polynomial_degree": int(polynomial_degree),
+        "spline_columns": list(spline_columns),
+        "spline_n_knots": int(spline_n_knots),
+        "spline_tensor_pairs": [list(pair) for pair in spline_tensor_pairs],
+        "categorical_slope_exclude_patterns": list(
+            categorical_slope_exclude_patterns
+        ),
+        "spline_categorical_exclude_patterns": list(
+            spline_categorical_exclude_patterns
+        ),
         "rff_components": int(rff_components),
+        "consumption_transform": consumption_transform,
+        "deposit_transform": deposit_transform,
+        "liquid_outflow_transform": liquid_outflow_transform,
+        "mpc_loss_weight": float(mpc_loss_weight),
+        "mpc_difference_weight_requested": (
+            None if mpc_difference_weight is None else float(mpc_difference_weight)
+        ),
+        "mpc_difference_weight_grid": [float(x) for x in candidate_mpc_weights],
+        "mpc_difference_weight_selected": float(
+            best_direct_mpc_weights["consumption"]
+        ),
+        "mpc_difference_rows_used": bool(
+            best_direct_mpc_weights["consumption"] > 0.0
+        ),
+        "mpc_objective_max_pairs": (
+            None if mpc_objective_max_pairs is None else int(mpc_objective_max_pairs)
+        ),
+        "mpc_objective_max_iter": int(mpc_objective_max_iter),
+        "mpc_objective_tol": float(mpc_objective_tol),
+        "mpc_objective_trim_quantile": float(mpc_objective_trim_quantile),
+        "mpc_stratify_age_bins": [float(x) for x in mpc_stratify_age_bins],
+        "mpc_stratify_liquid_bins": int(mpc_stratify_liquid_bins),
+        "mpc_objective_pairs_final": (
+            0 if final_mpc_design is None else int(final_mpc_design.n_pairs)
+        ),
+        "liquid_outflow_weight": float(selected_outflow_weight),
+        "liquid_outflow_reconciliation_search": reconciliation_rows,
         "ridge_alphas": best_alphas,
-        # Backwards-readable summary; there is deliberately no common alpha.
         "ridge_alpha": None,
         "ridge_search": alpha_rows,
         "n_rows": int(len(fit_data)),
@@ -3003,6 +4994,9 @@ def fit_policy_surrogate(
         "feature_count": int(Z_all.shape[1]),
         "feature_names": list(getattr(final_map, "feature_names_", [])),
         "state_columns": list(spec.state_columns),
+        "engineered_state_columns": list(spec.engineered_state_columns),
+        "redundant_state_columns": list(spec.redundant_state_columns),
+        "model_state_columns": list(spec.model_state_columns),
         "parameter_columns": list(parameters),
         "effective_parameter_columns": list(spec.parameter_columns),
         "categorical_state_columns": list(spec.categorical_state_columns),
@@ -3015,7 +5009,10 @@ def fit_policy_surrogate(
         "test_model_count": int(test["model_id"].nunique()),
         "target_parameterization": target_parameterization,
         "primitive_policy_targets": list(PRIMITIVE_POLICY_TARGETS),
+        "auxiliary_policy_targets": list(AUXILIARY_POLICY_TARGETS),
         "asset_choices_reconstructed_from_accounting": True,
+        "final_design_standardized": True,
+        "parameter_parameter_interactions": False,
         "money_units": money_units,
         "money_scale_median": (
             float(money_scale_values.median()) if len(money_scale_values) else None
@@ -3026,6 +5023,7 @@ def fit_policy_surrogate(
         "money_scale_max": (
             float(money_scale_values.max()) if len(money_scale_values) else None
         ),
+        "random_state": int(random_state),
     }
 
     _status(
@@ -3037,7 +5035,7 @@ def fit_policy_surrogate(
         feature_map=final_map,
         regressions=final_regressions,
         feature_spec=spec,
-        internal_targets=tuple(PRIMITIVE_POLICY_TARGETS),
+        internal_targets=tuple(ALL_FIT_TARGETS),
         target_transforms=final_transforms,
         target_parameterization=target_parameterization,
         output_bounds=output_bounds,
@@ -3047,6 +5045,7 @@ def fit_policy_surrogate(
         validation_metrics=validation_metrics,
         validation_by_model=validation_by_model,
         training_metadata=metadata,
+        liquid_outflow_weight=float(selected_outflow_weight),
     )
 
 
@@ -3064,6 +5063,8 @@ def train_from_saved_grids(
     rows_per_model: int = 2_000,
     max_total_rows: int = 250_000,
     max_models: int | None = None,
+    mpc_pair_share: float = 0.40,
+    mpc_check_sizes: Sequence[float] = (0.02, 0.05, 0.10, 0.188679, 0.20, 0.50),
     parameter_include: Sequence[str] | None = None,
     parameter_exclude: Sequence[str] = (),
     categorical_parameter_include: Sequence[str] | None = None,
@@ -3071,9 +5072,48 @@ def train_from_saved_grids(
     max_solver_distance: float | None = None,
     model_type: str = "polynomial",
     polynomial_degree: int = 2,
+    spline_columns: Sequence[str] = DEFAULT_SPLINE_COLUMNS,
+    spline_n_knots: int = 6,
+    spline_tensor_pairs: Sequence[tuple[str, str]] = DEFAULT_SPLINE_TENSOR_PAIRS,
+    categorical_slope_exclude_patterns: Sequence[str] = DEFAULT_CATEGORICAL_SLOPE_EXCLUDE_PATTERNS,
+    spline_categorical_exclude_patterns: Sequence[str] = DEFAULT_SPLINE_CATEGORICAL_EXCLUDE_PATTERNS,
     rff_components: int = 512,
+    ridge_alphas: Sequence[float] = (
+        1.0e-4,
+        1.0e-3,
+        1.0e-2,
+        0.1,
+        1.0,
+        10.0,
+        100.0,
+    ),
     target_parameterization: str = "accounting",
+    consumption_transform: str = "identity",
+    deposit_transform: str = "asinh",
+    liquid_outflow_transform: str = "identity",
+    mpc_loss_weight: float = 1.0,
+    mpc_difference_weight: float | None = None,
+    mpc_difference_weight_grid: Sequence[float] = (
+        0.0,
+        0.05,
+        0.10,
+        0.25,
+        0.50,
+        1.0,
+        2.0,
+    ),
+    mpc_objective_max_pairs: int | None = 250_000,
+    mpc_objective_max_iter: int = 200,
+    mpc_objective_tol: float = 1.0e-6,
+    mpc_objective_trim_quantile: float = 0.0,
+    mpc_stratify_age_bins: Sequence[float] = (45.0, 65.0, 70.0, 75.0),
+    mpc_stratify_liquid_bins: int = 4,
+    liquid_change_loss_weight: float = 1.0,
+    deposit_reconciliation_loss_weight: float = 0.50,
+    liquid_outflow_weight: float | None = None,
     state_columns: Sequence[str] = DEFAULT_STATE_COLUMNS,
+    engineered_state_columns: Sequence[str] = DEFAULT_ENGINEERED_STATE_COLUMNS,
+    redundant_state_columns: Sequence[str] = DEFAULT_REDUNDANT_STATE_COLUMNS,
     categorical_columns: Sequence[str] = DEFAULT_CATEGORICAL_COLUMNS,
     validation_share: float = 0.20,
     tuning_share: float = 0.20,
@@ -3093,6 +5133,8 @@ def train_from_saved_grids(
         rows_per_model=rows_per_model,
         max_total_rows=max_total_rows,
         max_models=max_models,
+        mpc_pair_share=mpc_pair_share,
+        mpc_check_sizes=mpc_check_sizes,
         parameter_include=parameter_include,
         parameter_exclude=parameter_exclude,
         categorical_parameter_include=categorical_parameter_include,
@@ -3106,6 +5148,28 @@ def train_from_saved_grids(
     dataset_path = _write_dataframe(dataset.data, output / "policy_grid_sample.pkl.gz")
     catalog_path = output / "model_catalog.csv"
     dataset.catalog.to_csv(catalog_path, index=False)
+    rejection_summary_path = output / "model_rejection_summary.csv"
+    rejected_catalog = dataset.catalog[~dataset.catalog["usable"]].copy()
+    if rejected_catalog.empty:
+        pd.DataFrame(columns=["rejection_code", "n_models"]).to_csv(
+            rejection_summary_path, index=False
+        )
+    else:
+        (
+            rejected_catalog.assign(
+                rejection_code=rejected_catalog["rejection_code"]
+                .replace("", "unspecified")
+                .fillna("unspecified")
+            )
+            .groupby("rejection_code", as_index=False)
+            .agg(
+                n_models=("model_id", "size"),
+                min_solver_distance=("solver_max_distance", "min"),
+                median_solver_distance=("solver_max_distance", "median"),
+                max_solver_distance=("solver_max_distance", "max"),
+            )
+            .to_csv(rejection_summary_path, index=False)
+        )
     failures_path = output / "grid_load_failures.csv"
     dataset.failures.to_csv(failures_path, index=False)
 
@@ -3115,11 +5179,34 @@ def train_from_saved_grids(
         parameter_columns=dataset.parameter_columns,
         categorical_parameter_columns=dataset.categorical_parameter_columns,
         state_columns=state_columns,
+        engineered_state_columns=engineered_state_columns,
+        redundant_state_columns=redundant_state_columns,
         categorical_columns=categorical_columns,
         model_type=model_type,
         polynomial_degree=polynomial_degree,
+        spline_columns=spline_columns,
+        spline_n_knots=spline_n_knots,
+        spline_tensor_pairs=spline_tensor_pairs,
+        categorical_slope_exclude_patterns=categorical_slope_exclude_patterns,
+        spline_categorical_exclude_patterns=spline_categorical_exclude_patterns,
         rff_components=rff_components,
+        ridge_alphas=ridge_alphas,
         target_parameterization=target_parameterization,
+        consumption_transform=consumption_transform,
+        deposit_transform=deposit_transform,
+        liquid_outflow_transform=liquid_outflow_transform,
+        mpc_loss_weight=mpc_loss_weight,
+        mpc_difference_weight=mpc_difference_weight,
+        mpc_difference_weight_grid=mpc_difference_weight_grid,
+        mpc_objective_max_pairs=mpc_objective_max_pairs,
+        mpc_objective_max_iter=mpc_objective_max_iter,
+        mpc_objective_tol=mpc_objective_tol,
+        mpc_objective_trim_quantile=mpc_objective_trim_quantile,
+        mpc_stratify_age_bins=mpc_stratify_age_bins,
+        mpc_stratify_liquid_bins=mpc_stratify_liquid_bins,
+        liquid_change_loss_weight=liquid_change_loss_weight,
+        deposit_reconciliation_loss_weight=deposit_reconciliation_loss_weight,
+        liquid_outflow_weight=liquid_outflow_weight,
         money_units=schema.money_units,
         validation_share=validation_share,
         tuning_share=tuning_share,
@@ -3128,6 +5215,17 @@ def train_from_saved_grids(
         show_progress=show_progress,
     )
     _status("[stage 4/4] Saving fitted bundle and diagnostics...", verbose=verbose)
+    if "policy_storage_format" in dataset.catalog:
+        usable_catalog = dataset.catalog[dataset.catalog["usable"]].copy()
+        bundle.training_metadata["policy_storage_counts"] = {
+            str(name): int(count)
+            for name, count in usable_catalog["policy_storage_format"]
+            .value_counts()
+            .items()
+        }
+    bundle.training_metadata["require_compact_policies"] = bool(
+        schema.require_compact_policies
+    )
     bundle.training_metadata["money_units"] = schema.money_units
     bundle.training_metadata["schema_money_units"] = schema.money_units
     bundle.training_metadata["policy_layout"] = schema.policy_layout
@@ -3144,8 +5242,15 @@ def train_from_saved_grids(
                 "parameter_columns": dataset.parameter_columns,
                 "categorical_parameter_columns": dataset.categorical_parameter_columns,
                 "state_columns": list(state_columns),
+                "engineered_state_columns": list(engineered_state_columns),
+                "redundant_state_columns": list(redundant_state_columns),
                 "categorical_columns": list(categorical_columns),
                 "rows_per_model": dataset.rows_per_model,
+                "mpc_pair_share": float(mpc_pair_share),
+                "mpc_check_sizes": [float(x) for x in mpc_check_sizes],
+                "spline_tensor_pairs": [list(pair) for pair in spline_tensor_pairs],
+                "mpc_stratify_age_bins": [float(x) for x in mpc_stratify_age_bins],
+                "mpc_stratify_liquid_bins": int(mpc_stratify_liquid_bins),
                 "training_metadata": bundle.training_metadata,
                 "feature_ranges": bundle.feature_ranges,
             },
@@ -3162,6 +5267,7 @@ def train_from_saved_grids(
         "bundle": bundle_path,
         "dataset": dataset_path,
         "catalog": catalog_path,
+        "rejection_summary": rejection_summary_path,
         "failures": failures_path,
         "validation_metrics": metrics_path,
         "validation_by_model": by_model_path,

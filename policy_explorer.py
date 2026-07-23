@@ -38,10 +38,13 @@ from ha_policy_visualization import (
     make_policy_surface,
 )
 from ha_mpc_distribution import (
+    ExactPolicyGrid,
     PopulationAssumptions,
     compute_check_mpcs,
+    compute_exact_grid_check_mpcs,
     generate_synthetic_population,
     infer_money_unit_info,
+    load_exact_policy_grid,
     mpc_summary,
     set_parameter_values,
 )
@@ -82,6 +85,17 @@ def _parse_args() -> argparse.Namespace:
 @st.cache_resource(show_spinner=False)
 def _load_bundle(path: str) -> PolicySurrogateBundle:
     return PolicySurrogateBundle.load(path)
+
+
+@st.cache_resource(show_spinner=False)
+def _load_exact_policy_grid_cached(
+    model_dir: str,
+    policy_layout: str,
+) -> ExactPolicyGrid:
+    return load_exact_policy_grid(
+        model_dir,
+        policy_layout=policy_layout,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -206,44 +220,6 @@ def _out_of_sample_model_summary(
     return summary
 
 
-def _button_label(value: Any) -> str:
-    try:
-        number = float(value)
-        if np.isfinite(number):
-            return f"{number:.6g}"
-    except (TypeError, ValueError):
-        pass
-
-    return str(value)
-
-
-def _display_value(value: Any) -> str:
-    """Convert mixed scalar metadata to a stable Arrow-compatible string."""
-
-    if value is None or value is pd.NA:
-        return ""
-
-    if isinstance(value, np.generic):
-        value = value.item()
-
-    if isinstance(value, float) and np.isnan(value):
-        return ""
-
-    return _button_label(value)
-
-
-def _arrow_safe_display(frame: pd.DataFrame) -> pd.DataFrame:
-    """Convert object/category columns to consistent strings for Streamlit."""
-
-    out = frame.copy()
-    for column in out.columns:
-        if pd.api.types.is_object_dtype(out[column].dtype) or isinstance(
-            out[column].dtype, pd.CategoricalDtype
-        ):
-            out[column] = out[column].map(_display_value).astype("string")
-    return out
-
-
 def _default_output_range(
     bundle: PolicySurrogateBundle,
     sample: pd.DataFrame,
@@ -290,48 +266,35 @@ def _default_output_range(
     return lo - padding, hi + padding
 
 
-def _reset_output_axis(
-    range_key: str,
-    min_widget_key: str,
-    max_widget_key: str,
-    default_range: tuple[float, float],
-) -> None:
-    """Reset a persistent output scale before Streamlit reruns the script."""
-
-    lo, hi = map(float, default_range)
-    st.session_state[range_key] = (lo, hi)
-    st.session_state[min_widget_key] = lo
-    st.session_state[max_widget_key] = hi
-
-
 def _output_axis_control(
     bundle: PolicySurrogateBundle,
     sample: pd.DataFrame,
     output: str,
     *,
     context: str,
-    button_label: str = "Change y-axis",
-    axis_description: str = "y-axis",
 ) -> tuple[float, float]:
-    """Persistent output limits that do not move when parameters change."""
+    """Persistent axis limits that do not change when other controls move."""
 
     default_range = _default_output_range(bundle, sample, output)
 
     range_key = f"{context}__fixed_output_range__{output}"
-    min_widget_key = f"{context}__axis_min__{output}"
-    max_widget_key = f"{context}__axis_max__{output}"
+    min_widget_key = f"{context}__ymin__{output}"
+    max_widget_key = f"{context}__ymax__{output}"
 
     if range_key not in st.session_state:
-        st.session_state[range_key] = tuple(map(float, default_range))
+        st.session_state[range_key] = default_range
 
     current_lo, current_hi = st.session_state[range_key]
-    st.session_state.setdefault(min_widget_key, float(current_lo))
-    st.session_state.setdefault(max_widget_key, float(current_hi))
 
-    with st.popover(button_label):
+    if min_widget_key not in st.session_state:
+        st.session_state[min_widget_key] = float(current_lo)
+    if max_widget_key not in st.session_state:
+        st.session_state[max_widget_key] = float(current_hi)
+
+    with st.popover("Change y-axis"):
         st.caption(
-            f"The {axis_description} remains fixed when household states or "
-            "model parameters change."
+            "These limits remain fixed when household states or model "
+            "parameters change."
         )
 
         lo = st.number_input(
@@ -350,20 +313,17 @@ def _output_axis_control(
         else:
             st.session_state[range_key] = (float(lo), float(hi))
 
-        st.button(
+        if st.button(
             "Reset to data range",
-            key=f"{context}__reset_axis__{output}",
-            # width="stretch",
-            on_click=_reset_output_axis,
-            args=(
-                range_key,
-                min_widget_key,
-                max_widget_key,
-                default_range,
-            ),
-        )
+            key=f"{context}__reset_y__{output}",
+            use_container_width=True,
+        ):
+            st.session_state[range_key] = default_range
+            st.session_state[min_widget_key] = float(default_range[0])
+            st.session_state[max_widget_key] = float(default_range[1])
+            st.rerun()
 
-    return tuple(map(float, st.session_state[range_key]))
+    return tuple(st.session_state[range_key])
 
 
 def _continuous_plot_columns(
@@ -400,6 +360,29 @@ def _pretty(name: str) -> str:
         .replace("_", " ")
         .title()
     )
+
+
+def _button_label(value: Any) -> str:
+    """Format mixed parameter/state values for display tables."""
+
+    if value is None or value is pd.NA:
+        return ""
+
+    if isinstance(value, np.generic):
+        value = value.item()
+
+    if isinstance(value, float) and not np.isfinite(value):
+        return ""
+
+    if isinstance(value, (bool, np.bool_)):
+        return "True" if bool(value) else "False"
+
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        if np.isfinite(number):
+            return f"{number:.6g}"
+
+    return str(value)
 
 
 def _continuous_control(
@@ -762,13 +745,17 @@ def _one_dimensional_page(
         )
 
     x_range = _range_selector(bundle, x, "one_d_x_range")
+    linked_columns = [
+        col
+        for col in ("labor_income_state",)
+        if col in bundle.feature_spec.state_columns
+    ]
 
     linked_label = (
         "Move labor income state proportionally with current income"
         if linked_columns
         else "No labor-income state is included in this model"
     )
-
     linked_income_requested = st.checkbox(
         linked_label,
         value=bool(linked_columns),
@@ -828,70 +815,62 @@ def _one_dimensional_page(
         linked_income=linked_income,
         y_range=y_range,
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
     with st.expander("Fixed values used in this slice"):
         display = pd.DataFrame(
             {
-                "variable": list(base),
-                "value": [base[key] for key in base],
-            }
+                "Variable": [_pretty(name) for name in base],
+                "Value": [_button_label(base[name]) for name in base],
+            },
+            dtype="string",
         )
-        st.dataframe(
-            _arrow_safe_display(display),
-            hide_index=True,
-            width="stretch",
-        )
+        st.dataframe(display, hide_index=True, use_container_width=True)
 
 
 def _surface_page(
-    bundle: PolicySurrogateBundle,
-    base: dict[str, Any],
-    *,
-    bundle_path: str | Path,
+    bundle: PolicySurrogateBundle, base: dict[str, Any], *, bundle_path: str | Path
 ) -> None:
-    """Plot a two-dimensional state/parameter surface as a heatmap."""
-
-    continuous = _continuous_plot_columns(bundle)
-    if len(continuous) < 2:
-        st.info("At least two continuous variables are required for a surface.")
-        return
-
-    sample = _load_training_sample(str(bundle_path))
-
-    default_x = "current_income" if "current_income" in continuous else continuous[0]
-    current_x = st.session_state.get("surface_x", default_x)
-    if current_x not in continuous:
-        st.session_state.pop("surface_x", None)
-        current_x = default_x
-
-    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.15, 0.85])
-
+    continuous = list(bundle.feature_spec.state_columns) + [
+        c for c in bundle.feature_spec.parameter_columns if not c.endswith("__missing")
+    ]
+    continuous = [
+        c
+        for c in continuous
+        if c in bundle.feature_ranges
+        and c
+        not in {
+            "after_tax_income",
+            "total_assets",
+            "cash_on_hand",
+            "years_to_retirement",
+        }
+    ]
+    c1, c2, c3 = st.columns(3)
     with c1:
         x = st.selectbox(
             "Horizontal axis",
             continuous,
-            index=continuous.index(current_x),
+            index=(
+                continuous.index("current_income")
+                if "current_income" in continuous
+                else 0
+            ),
             format_func=_pretty,
             key="surface_x",
         )
-
-    y_options = [column for column in continuous if column != x]
-    default_y = "liquid_assets" if "liquid_assets" in y_options else y_options[0]
-    current_y = st.session_state.get("surface_y", default_y)
-    if current_y not in y_options:
-        st.session_state.pop("surface_y", None)
-        current_y = default_y
-
+    y_options = [c for c in continuous if c != x]
     with c2:
+        y_default = (
+            y_options.index("liquid_assets") if "liquid_assets" in y_options else 0
+        )
         y = st.selectbox(
             "Vertical axis",
             y_options,
-            index=y_options.index(current_y),
+            index=y_default,
             format_func=_pretty,
             key="surface_y",
         )
-
     with c3:
         output = st.selectbox(
             "Policy choice",
@@ -900,36 +879,19 @@ def _surface_page(
             key="surface_output",
         )
 
-    with c4:
-        outcome_range = _output_axis_control(
-            bundle,
-            sample,
-            output,
-            context="two_dimensional",
-            button_label="Change outcome scale",
-            axis_description="outcome color scale",
-        )
-
-    st.caption(
-        "The selected outcome is represented by color. Its scale stays fixed "
-        "when parameters or household states change unless you edit it above."
-    )
-
     xr = _range_selector(bundle, x, "surface_x_range")
     yr = _range_selector(bundle, y, "surface_y_range")
-
     linked_columns = [
-        column
-        for column in ("labor_income_state",)
-        if (column in bundle.feature_spec.state_columns and column not in {x, y})
+        col
+        for col in ("labor_income_state",)
+        if col in bundle.feature_spec.state_columns and col not in {x, y}
     ]
     linked_income = st.checkbox(
-        "Move labor income state proportionally when current income varies",
+        "Move other included income-state variables proportionally when current income varies",
         value=bool(linked_columns),
         disabled=("current_income" not in {x, y} or not linked_columns),
         key="surface_linked_income",
     )
-
     x_values = np.linspace(xr[0], xr[1], 65)
     y_values = np.linspace(yr[0], yr[1], 65)
     surface = make_policy_surface(
@@ -939,29 +901,26 @@ def _surface_page(
         x_values=x_values,
         y_values=y_values,
         base=base,
-        linked_income=bool(linked_income),
+        linked_income=linked_income,
     )
-    table = surface.pivot(
-        index="__y",
-        columns="__x",
-        values=f"pred_{output}",
-    )
+    table = surface.pivot(index="__y", columns="__x", values=f"pred_{output}")
 
+    sample = _load_training_sample(str(bundle_path))
+    z_range = _output_axis_control(
+        bundle,
+        sample,
+        output,
+        context="two_dimensional",
+    )
     fig = go.Figure(
         data=go.Heatmap(
-            x=table.columns.to_numpy(dtype=float),
-            y=table.index.to_numpy(dtype=float),
-            z=table.to_numpy(dtype=float),
-            zmin=float(outcome_range[0]),
-            zmax=float(outcome_range[1]),
+            x=table.columns,
+            y=table.index,
+            z=table.to_numpy(),
+            zmin=float(z_range[0]),
+            zmax=float(z_range[1]),
             zauto=False,
             colorbar=dict(title=_pretty(output)),
-            hovertemplate=(
-                f"{_pretty(x)}: %{{x:.4g}}<br>"
-                f"{_pretty(y)}: %{{y:.4g}}<br>"
-                f"{_pretty(output)}: %{{z:.4g}}"
-                "<extra></extra>"
-            ),
         )
     )
     fig.update_layout(
@@ -969,9 +928,9 @@ def _surface_page(
         height=650,
         xaxis_title=_pretty(x),
         yaxis_title=_pretty(y),
-        margin=dict(l=40, r=30, t=30, b=40),
+        margin=dict(l=40, r=20, t=30, b=40),
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def _mpc_histogram_figure(
@@ -1270,7 +1229,7 @@ def _mpc_distribution_page(
         reference=reference,
         check_amount_dollars=float(check_amount),
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
     st.download_button(
         "Download household MPCs as CSV",
         data=response.to_csv(index=False).encode("utf-8"),
@@ -1313,7 +1272,7 @@ def _mpc_distribution_page(
         .sort_values("mean_mpc", ascending=False)
     )
     with st.expander("MPCs and state diagnostics by population type"):
-        st.dataframe(subgroup, hide_index=True, width="stretch")
+        st.dataframe(subgroup, hide_index=True, use_container_width=True)
         diagnostics = pd.DataFrame(
             {
                 "statistic": [
@@ -1330,42 +1289,81 @@ def _mpc_distribution_page(
                 ],
             }
         )
-        st.dataframe(diagnostics, hide_index=True, width="stretch")
+        st.dataframe(diagnostics, hide_index=True, use_container_width=True)
 
 
-def _exact_grid_comparison_page(
+def _resolve_model_dir(
+    bundle_path: str | Path,
+    raw_model_dir: Any,
+) -> Path:
+    """Resolve either an absolute catalog path or an app-data-relative path."""
+
+    model_dir = Path(str(raw_model_dir)).expanduser()
+    if not model_dir.is_absolute():
+        model_dir = Path(bundle_path).expanduser().resolve().parent / model_dir
+    return model_dir.resolve()
+
+
+def _model_base_from_catalog_row(
     bundle: PolicySurrogateBundle,
     base: dict[str, Any],
+    selected_row: pd.Series,
+) -> dict[str, Any]:
+    """Replace sidebar parameters with one solved model's parameter vector."""
+
+    model_base = dict(base)
+    for column in bundle.feature_spec.parameter_columns:
+        if column.endswith("__missing"):
+            model_base[column] = 0
+        elif column in selected_row.index and pd.notna(selected_row[column]):
+            model_base[column] = float(selected_row[column])
+    for column in bundle.feature_spec.categorical_parameter_columns:
+        if column in selected_row.index and pd.notna(selected_row[column]):
+            model_base[column] = str(selected_row[column])
+    return model_base
+
+
+def _model_parameter_table(
+    catalog: pd.DataFrame,
+    selected_row: pd.Series,
+) -> pd.DataFrame:
+    parameter_columns = [
+        column
+        for column in catalog.columns
+        if column.startswith("param__") and not column.endswith("__missing")
+    ]
+    rows: list[dict[str, str]] = []
+    for column in parameter_columns:
+        value = selected_row.get(column)
+        if pd.isna(value):
+            continue
+        rows.append(
+            {
+                "Parameter": _pretty(column),
+                "Value": _button_label(value),
+            }
+        )
+    return pd.DataFrame(rows, columns=["Parameter", "Value"], dtype="string")
+
+
+def _held_out_model_selector(
+    bundle: PolicySurrogateBundle,
     *,
     bundle_path: str | Path,
-) -> None:
-    st.subheader("Held-out grid versus polynomial surrogate")
-
-    st.caption(
-        "Each model below was excluded when the evaluation surrogate "
-        "was fitted. The reported R² values are therefore out of sample."
-    )
+    key_prefix: str,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, Path] | None:
+    """Display held-out performance and return the selected solved model."""
 
     try:
         catalog = _load_model_catalog(str(bundle_path))
-        model_summary = _out_of_sample_model_summary(
-            bundle,
-            catalog,
-        )
+        model_summary = _out_of_sample_model_summary(bundle, catalog)
     except Exception as exc:
         st.error(str(exc))
-        return
+        return None
 
     display_summary = model_summary[
-        [
-            "model_id",
-            "consumption_r2",
-            "deposit_r2",
-            "mean_r2",
-        ]
-    ].copy()
-
-    display_summary = display_summary.rename(
+        ["model_id", "consumption_r2", "deposit_r2", "mean_r2"]
+    ].rename(
         columns={
             "model_id": "Model",
             "consumption_r2": "Consumption R²",
@@ -1373,11 +1371,10 @@ def _exact_grid_comparison_page(
             "mean_r2": "Mean R²",
         }
     )
-
     st.dataframe(
         display_summary,
         hide_index=True,
-        width="stretch",
+        use_container_width=True,
         column_config={
             "Consumption R²": st.column_config.NumberColumn(format="%.4f"),
             "Deposit R²": st.column_config.NumberColumn(format="%.4f"),
@@ -1386,21 +1383,16 @@ def _exact_grid_comparison_page(
     )
 
     summary_lookup = model_summary.set_index("model_id")
-
     model_ids = model_summary["model_id"].astype(str).tolist()
 
     def format_model_option(model_id: str) -> str:
         row = summary_lookup.loc[str(model_id)]
-
-        consumption_r2 = row["consumption_r2"]
-        deposit_r2 = row["deposit_r2"]
-
-        consumption_text = f"{consumption_r2:.4f}" if pd.notna(consumption_r2) else "NA"
-        deposit_text = f"{deposit_r2:.4f}" if pd.notna(deposit_r2) else "NA"
-
+        consumption = row["consumption_r2"]
+        deposit = row["deposit_r2"]
+        consumption_text = f"{consumption:.4f}" if pd.notna(consumption) else "NA"
+        deposit_text = f"{deposit:.4f}" if pd.notna(deposit) else "NA"
         return (
-            f"{model_id}  |  "
-            f"Consumption R²: {consumption_text}  |  "
+            f"{model_id}  |  Consumption R²: {consumption_text}  |  "
             f"Deposit R²: {deposit_text}"
         )
 
@@ -1408,39 +1400,26 @@ def _exact_grid_comparison_page(
         "Select an out-of-sample model",
         model_ids,
         format_func=format_model_option,
-        key="exact_selected_model_id",
+        key=f"{key_prefix}_selected_model_id",
     )
-
     selected_summary = summary_lookup.loc[str(selected_model_id)]
-
-    catalog_for_selection = catalog.copy()
-    catalog_for_selection["model_id"] = catalog_for_selection["model_id"].astype(str)
-
-    selected_catalog_rows = catalog_for_selection[
-        catalog_for_selection["model_id"] == str(selected_model_id)
-    ]
-
-    if selected_catalog_rows.empty:
+    catalog_copy = catalog.copy()
+    catalog_copy["model_id"] = catalog_copy["model_id"].astype(str)
+    rows = catalog_copy[catalog_copy["model_id"] == str(selected_model_id)]
+    if rows.empty:
         st.error(f"Model {selected_model_id} is missing from model_catalog.csv.")
-        return
-
-    selected_row = selected_catalog_rows.iloc[0]
-
-    model_dir = selected_row.get(
-        "model_dir",
-        selected_summary.get("model_dir"),
-    )
-
-    if pd.isna(model_dir):
+        return None
+    selected_row = rows.iloc[0]
+    raw_model_dir = selected_row.get("model_dir", selected_summary.get("model_dir"))
+    if pd.isna(raw_model_dir):
         st.error("The selected model has no model_dir entry.")
-        return
-
-    model_dir = Path(str(model_dir)).expanduser()
-    if not model_dir.is_absolute():
-        model_dir = Path(bundle_path).expanduser().resolve().parent / model_dir
+        return None
+    model_dir = _resolve_model_dir(bundle_path, raw_model_dir)
+    if not model_dir.exists():
+        st.error(f"The selected model directory does not exist: {model_dir}")
+        return None
 
     metric_columns = st.columns(3)
-
     metric_columns[0].metric(
         "Consumption R²",
         (
@@ -1449,7 +1428,6 @@ def _exact_grid_comparison_page(
             else "NA"
         ),
     )
-
     metric_columns[1].metric(
         "Deposit R²",
         (
@@ -1458,7 +1436,6 @@ def _exact_grid_comparison_page(
             else "NA"
         ),
     )
-
     metric_columns[2].metric(
         "Mean R²",
         (
@@ -1468,55 +1445,37 @@ def _exact_grid_comparison_page(
         ),
     )
 
-    # ------------------------------------------------------------------
-    # Display the selected model's parameters.
-    # ------------------------------------------------------------------
-
-    parameter_columns = [
-        column
-        for column in catalog.columns
-        if column.startswith("param__") and not column.endswith("__missing")
-    ]
-
-    parameter_rows: list[dict[str, str]] = []
-
-    for column in parameter_columns:
-        value = selected_row.get(column)
-
-        if pd.isna(value):
-            continue
-
-        parameter_rows.append(
-            {
-                "Parameter": _pretty(column),
-                # Convert all values to strings to avoid Arrow mixed-type
-                # serialization warnings.
-                "Value": _button_label(value),
-            }
+    with st.expander("Selected model parameters", expanded=True):
+        st.dataframe(
+            _model_parameter_table(catalog, selected_row),
+            hide_index=True,
+            use_container_width=True,
         )
+    return catalog, selected_row, selected_summary, model_dir
 
-    parameter_table = pd.DataFrame(
-        parameter_rows,
-        columns=["Parameter", "Value"],
-        dtype="string",
+
+def _exact_grid_comparison_page(
+    bundle: PolicySurrogateBundle,
+    base: dict[str, Any],
+    *,
+    bundle_path: str | Path,
+) -> None:
+    st.subheader("Held-out grid versus polynomial surrogate")
+    st.caption(
+        "Each model below was excluded when the evaluation surrogate was fitted. "
+        "The reported R² values are therefore out of sample."
     )
 
-    with st.expander(
-        "Selected model parameters",
-        expanded=True,
-    ):
-        st.dataframe(
-            parameter_table,
-            hide_index=True,
-            width="stretch",
-        )
-
-    # ------------------------------------------------------------------
-    # Choose the state slice and plotted policy.
-    # ------------------------------------------------------------------
+    selection = _held_out_model_selector(
+        bundle,
+        bundle_path=bundle_path,
+        key_prefix="exact_policy",
+    )
+    if selection is None:
+        return
+    _, selected_row, _, model_dir = selection
 
     c1, c2 = st.columns(2)
-
     exact_x_options = [
         column
         for column in [
@@ -1528,7 +1487,6 @@ def _exact_grid_comparison_page(
         ]
         if column in bundle.feature_ranges
     ]
-
     with c1:
         x = st.selectbox(
             "Horizontal axis",
@@ -1541,7 +1499,6 @@ def _exact_grid_comparison_page(
             format_func=_pretty,
             key="exact_comparison_x",
         )
-
     with c2:
         output = st.selectbox(
             "Policy choice",
@@ -1550,46 +1507,17 @@ def _exact_grid_comparison_page(
             key="exact_comparison_output",
         )
 
-    x_range = _range_selector(
-        bundle,
-        x,
-        "exact_comparison_x_range",
-    )
-
+    x_range = _range_selector(bundle, x, "exact_comparison_x_range")
     sample = _load_training_sample(str(bundle_path))
-
     y_range = _output_axis_control(
         bundle,
         sample,
         output,
         context="exact_comparison",
     )
-
-    # Start from the sidebar household state and replace every model
-    # parameter with the values from the selected held-out model.
-    model_base = dict(base)
-
-    for column in bundle.feature_spec.parameter_columns:
-        if column in selected_row.index and pd.notna(selected_row[column]):
-            model_base[column] = float(selected_row[column])
-
-    for column in bundle.feature_spec.categorical_parameter_columns:
-        if column in selected_row.index and pd.notna(selected_row[column]):
-            model_base[column] = str(selected_row[column])
-
-    policy_layout = str(
-        bundle.training_metadata.get(
-            "policy_layout",
-            "GHKEBA",
-        )
-    )
-
-    money_units = str(
-        bundle.training_metadata.get(
-            "money_units",
-            "model",
-        )
-    )
+    model_base = _model_base_from_catalog_row(bundle, base, selected_row)
+    policy_layout = str(bundle.training_metadata.get("policy_layout", "GHKEBA"))
+    money_units = str(bundle.training_metadata.get("money_units", "model"))
 
     try:
         exact = load_exact_grid_slice(
@@ -1603,24 +1531,18 @@ def _exact_grid_comparison_page(
     except Exception as exc:
         st.error(f"Could not load the exact policy grid: {exc}")
         return
-
     if exact.empty:
         st.warning("No exact grid points fall inside the selected x-axis range.")
         return
 
-    # Evaluate the polynomial at precisely the same state points as the
-    # grid-based policy.
     surrogate_input = pd.DataFrame([model_base] * len(exact))
-
     state_columns = set(
         bundle.feature_spec.state_columns
         + bundle.feature_spec.categorical_state_columns
     )
-
     for column in state_columns:
         if column in exact:
             surrogate_input[column] = exact[column].to_numpy()
-
     for column in [
         "liquid_grid_min",
         "liquid_grid_max",
@@ -1630,9 +1552,7 @@ def _exact_grid_comparison_page(
     ]:
         if column in exact:
             surrogate_input[column] = exact[column].to_numpy()
-
     surrogate = bundle.predict(surrogate_input)
-
     comparison = pd.DataFrame(
         {
             x: exact["__x"].to_numpy(),
@@ -1640,11 +1560,9 @@ def _exact_grid_comparison_page(
             "polynomial": surrogate[output].to_numpy(),
         }
     )
-
     comparison["error"] = comparison["polynomial"] - comparison["exact_grid"]
 
     fig = go.Figure()
-
     fig.add_trace(
         go.Scatter(
             x=comparison[x],
@@ -1654,7 +1572,6 @@ def _exact_grid_comparison_page(
             marker=dict(size=6),
         )
     )
-
     fig.add_trace(
         go.Scatter(
             x=comparison[x],
@@ -1664,58 +1581,392 @@ def _exact_grid_comparison_page(
             line=dict(width=3),
         )
     )
-
     fig.update_layout(
         template="plotly_white",
         height=620,
         xaxis_title=_pretty(x),
         yaxis_title=_pretty(output),
-        yaxis=dict(
-            range=[
-                float(y_range[0]),
-                float(y_range[1]),
-            ],
-            autorange=False,
-        ),
+        yaxis=dict(range=[float(y_range[0]), float(y_range[1])], autorange=False),
         hovermode="x unified",
         legend_title="Policy source",
-        margin=dict(
-            l=40,
-            r=20,
-            t=40,
-            b=40,
-        ),
+        margin=dict(l=40, r=20, t=40, b=40),
     )
-
-    st.plotly_chart(
-        fig,
-        width="stretch",
-    )
+    st.plotly_chart(fig, use_container_width=True)
 
     rmse = float(np.sqrt(np.mean(comparison["error"] ** 2)))
-
     max_error = float(comparison["error"].abs().max())
-
     m1, m2, m3 = st.columns(3)
-
-    m1.metric(
-        "Points compared",
-        f"{len(comparison):,}",
-    )
-    m2.metric(
-        "Slice RMSE",
-        f"{rmse:.6g}",
-    )
-    m3.metric(
-        "Maximum absolute error",
-        f"{max_error:.6g}",
-    )
-
+    m1.metric("Points compared", f"{len(comparison):,}")
+    m2.metric("Slice RMSE", f"{rmse:.6g}")
+    m3.metric("Maximum absolute error", f"{max_error:.6g}")
     with st.expander("Comparison data"):
-        st.dataframe(
-            comparison,
-            hide_index=True,
-            width="stretch",
+        st.dataframe(comparison, hide_index=True, use_container_width=True)
+
+
+def _model_surrogate_mpc_histogram(
+    exact_response: pd.DataFrame,
+    surrogate_response: pd.DataFrame,
+    *,
+    check_amount_dollars: float,
+    bins: int = 60,
+) -> go.Figure:
+    exact = pd.to_numeric(exact_response["mpc"], errors="coerce").to_numpy(dtype=float)
+    surrogate = pd.to_numeric(surrogate_response["mpc"], errors="coerce").to_numpy(
+        dtype=float
+    )
+    exact = exact[np.isfinite(exact)]
+    surrogate = surrogate[np.isfinite(surrogate)]
+    if not len(exact) or not len(surrogate):
+        raise ValueError("No finite exact-model or surrogate MPCs are available.")
+    pooled = np.concatenate([exact, surrogate])
+    lo, hi = np.quantile(pooled, [0.005, 0.995])
+    lo = min(float(lo), -0.05)
+    hi = max(float(hi), 1.05)
+    if hi <= lo + 1.0e-12:
+        lo, hi = lo - 0.05, hi + 0.05
+    edges = np.linspace(lo, hi, int(bins) + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    widths = np.diff(edges)
+    exact_density, _ = np.histogram(exact, bins=edges, density=True)
+    surrogate_density, _ = np.histogram(surrogate, bins=edges, density=True)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=centers,
+            y=exact_density,
+            width=widths,
+            name="Solved model",
+            opacity=0.65,
+            hovertemplate="MPC: %{x:.3f}<br>Exact density: %{y:.3f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=centers,
+            y=surrogate_density,
+            mode="lines",
+            name="Polynomial surrogate",
+            line=dict(width=3),
+            hovertemplate=(
+                "MPC: %{x:.3f}<br>Surrogate density: %{y:.3f}<extra></extra>"
+            ),
+        )
+    )
+    fig.add_vline(
+        x=float(np.mean(exact)),
+        line_dash="dash",
+        annotation_text=f"Model mean {np.mean(exact):.3f}",
+        annotation_position="top left",
+    )
+    fig.add_vline(
+        x=float(np.mean(surrogate)),
+        line_dash="dot",
+        annotation_text=f"Surrogate mean {np.mean(surrogate):.3f}",
+        annotation_position="top right",
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=620,
+        title=(
+            "Solved-model and polynomial MPC distributions for an unexpected "
+            f"${check_amount_dollars:,.0f} check"
+        ),
+        xaxis_title="Marginal propensity to consume",
+        yaxis_title="Density",
+        barmode="overlay",
+        legend_title="Policy source",
+        margin=dict(l=45, r=20, t=75, b=45),
+    )
+    fig.update_xaxes(range=[lo, hi])
+    return fig
+
+
+def _mpc_grid_comparison_page(
+    bundle: PolicySurrogateBundle,
+    base: dict[str, Any],
+    *,
+    bundle_path: str | Path,
+) -> None:
+    st.subheader("Held-out model MPCs versus polynomial MPCs")
+    st.caption(
+        "The exact model and polynomial are evaluated on the same synthetic "
+        "households. Ages, persistent-income states, employment states, and "
+        "groups are first mapped to the selected model's solved grid; liquid and "
+        "illiquid assets remain continuous and are interpolated."
+    )
+
+    selection = _held_out_model_selector(
+        bundle,
+        bundle_path=bundle_path,
+        key_prefix="mpc_exact",
+    )
+    if selection is None:
+        return
+    _, selected_row, _, model_dir = selection
+    model_base = _model_base_from_catalog_row(bundle, base, selected_row)
+    policy_layout = str(bundle.training_metadata.get("policy_layout", "GHKEBA"))
+
+    inferred = infer_money_unit_info(bundle, bundle_path=bundle_path)
+    c1, c2, c3, c4 = st.columns([1.0, 1.0, 1.25, 1.1])
+    with c1:
+        check_amount = st.number_input(
+            "Check amount ($)",
+            min_value=100.0,
+            max_value=100_000.0,
+            value=10_000.0,
+            step=500.0,
+            key="mpc_exact_check_amount",
+        )
+    with c2:
+        n_households = st.select_slider(
+            "Synthetic households",
+            options=[2_000, 5_000, 10_000, 20_000, 50_000],
+            value=20_000,
+            key="mpc_exact_population_size",
+        )
+    with c3:
+        normalized_units = st.checkbox(
+            "Bundle uses normalized model units",
+            value=(inferred.money_units == "model"),
+            key="mpc_exact_normalized_units",
+        )
+        money_units = "model" if normalized_units else "data"
+    with c4:
+        dollars_per_unit = st.number_input(
+            "Dollars per model unit",
+            min_value=1.0,
+            max_value=10_000_000.0,
+            value=float(inferred.dollars_per_model_unit),
+            step=1_000.0,
+            disabled=not normalized_units,
+            key="mpc_exact_dollars_per_unit",
+            help=f"Initial value source: {inferred.source}.",
+        )
+        if not normalized_units:
+            dollars_per_unit = 1.0
+
+    with st.expander("Population distribution assumptions", expanded=False):
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            median_income = st.number_input(
+                "Median annual income ($)",
+                min_value=10_000.0,
+                max_value=250_000.0,
+                value=60_000.0,
+                step=5_000.0,
+                key="mpc_exact_median_income",
+            )
+            permanent_sd = st.slider(
+                "Permanent log-income SD",
+                min_value=0.10,
+                max_value=1.20,
+                value=0.50,
+                step=0.02,
+                key="mpc_exact_perm_sd",
+            )
+            transitory_sd = st.slider(
+                "Transitory log-income SD",
+                min_value=0.00,
+                max_value=0.70,
+                value=0.20,
+                step=0.02,
+                key="mpc_exact_transitory_sd",
+            )
+        with a2:
+            poor_share = st.slider(
+                "Poor hand-to-mouth share",
+                min_value=0.0,
+                max_value=0.60,
+                value=0.25,
+                step=0.01,
+                key="mpc_exact_poor_share",
+            )
+            wealthy_share = st.slider(
+                "Wealthy hand-to-mouth share",
+                min_value=0.0,
+                max_value=0.50,
+                value=0.15,
+                step=0.01,
+                key="mpc_exact_wealthy_share",
+            )
+            high_education_share = st.slider(
+                "High-education share",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.55,
+                step=0.01,
+                key="mpc_exact_education_share",
+            )
+        with a3:
+            regular_liquid_ratio = st.slider(
+                "Regular saver: median liquid wealth / income",
+                min_value=0.01,
+                max_value=1.50,
+                value=0.25,
+                step=0.01,
+                key="mpc_exact_liquid_ratio",
+            )
+            regular_illiquid_ratio = st.slider(
+                "Regular saver: median illiquid wealth / income",
+                min_value=0.10,
+                max_value=6.00,
+                value=1.25,
+                step=0.05,
+                key="mpc_exact_illiquid_ratio",
+            )
+            seed = st.number_input(
+                "Population seed",
+                min_value=0,
+                max_value=2_147_483_647,
+                value=20260717,
+                step=1,
+                key="mpc_exact_seed",
+            )
+
+    if poor_share + wealthy_share > 1.0:
+        st.error("Poor and wealthy hand-to-mouth shares cannot sum to more than one.")
+        return
+    assumptions = PopulationAssumptions(
+        n_households=int(n_households),
+        seed=int(seed),
+        median_income_dollars=float(median_income),
+        permanent_income_log_sd=float(permanent_sd),
+        transitory_income_log_sd=float(transitory_sd),
+        high_education_share=float(high_education_share),
+        poor_hand_to_mouth_share=float(poor_share),
+        wealthy_hand_to_mouth_share=float(wealthy_share),
+        regular_liquid_ratio_median=float(regular_liquid_ratio),
+        regular_illiquid_ratio_median=float(regular_illiquid_ratio),
+    )
+
+    population = generate_synthetic_population(
+        bundle,
+        base_values=model_base,
+        assumptions=assumptions,
+        dollars_per_model_unit=float(dollars_per_unit),
+        money_units=money_units,
+    )
+    try:
+        exact_grid = _load_exact_policy_grid_cached(str(model_dir), policy_layout)
+        exact_response = compute_exact_grid_check_mpcs(
+            exact_grid,
+            population,
+            check_amount_dollars=float(check_amount),
+            dollars_per_model_unit=float(dollars_per_unit),
+            money_units=money_units,
+        )
+    except Exception as exc:
+        st.error(f"Could not evaluate exact-grid MPCs: {exc}")
+        return
+
+    # The exact response contains the population aligned to the solved model's
+    # exogenous states. Evaluate the surrogate on precisely those same states.
+    surrogate_population = set_parameter_values(
+        exact_response.copy(),
+        bundle,
+        model_base,
+    )
+    surrogate_response = compute_check_mpcs(
+        bundle,
+        surrogate_population,
+        check_amount_dollars=float(check_amount),
+        dollars_per_model_unit=float(dollars_per_unit),
+        money_units=money_units,
+    )
+
+    exact_summary = mpc_summary(exact_response)
+    surrogate_summary = mpc_summary(surrogate_response)
+    exact_mpc = pd.to_numeric(exact_response["mpc"], errors="coerce").to_numpy(
+        dtype=float
+    )
+    surrogate_mpc = pd.to_numeric(surrogate_response["mpc"], errors="coerce").to_numpy(
+        dtype=float
+    )
+    finite = np.isfinite(exact_mpc) & np.isfinite(surrogate_mpc)
+    if not finite.any():
+        st.error("No finite paired MPC predictions are available.")
+        return
+    mpc_error = surrogate_mpc[finite] - exact_mpc[finite]
+    mpc_rmse = float(np.sqrt(np.mean(mpc_error**2)))
+    mpc_bias = float(np.mean(mpc_error))
+    correlation = (
+        float(np.corrcoef(exact_mpc[finite], surrogate_mpc[finite])[0, 1])
+        if finite.sum() > 1
+        and np.std(exact_mpc[finite]) > 0
+        and np.std(surrogate_mpc[finite]) > 0
+        else np.nan
+    )
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Model mean MPC", f"{exact_summary['mean']:.3f}")
+    m2.metric("Surrogate mean MPC", f"{surrogate_summary['mean']:.3f}")
+    m3.metric("Model median", f"{exact_summary['median']:.3f}")
+    m4.metric("Surrogate median", f"{surrogate_summary['median']:.3f}")
+    m5.metric("Paired MPC RMSE", f"{mpc_rmse:.4f}")
+    m6.metric(
+        "MPC correlation", f"{correlation:.3f}" if np.isfinite(correlation) else "NA"
+    )
+
+    fig = _model_surrogate_mpc_histogram(
+        exact_response,
+        surrogate_response,
+        check_amount_dollars=float(check_amount),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    comparison = pd.DataFrame(
+        {
+            "model_mpc": exact_mpc,
+            "surrogate_mpc": surrogate_mpc,
+            "error": surrogate_mpc - exact_mpc,
+            "population_type": exact_response.get("population_type", "unknown"),
+        }
+    )
+    paired = comparison.loc[finite].copy()
+    paired_summary = pd.DataFrame(
+        {
+            "Statistic": [
+                "Paired households",
+                "Mean surrogate minus model MPC",
+                "Paired MPC RMSE",
+                "Paired MPC correlation",
+                "Exact post-check state clipped",
+                "Exact asset state initially clipped",
+                "Exact exogenous state mapped to nearest grid point",
+            ],
+            "Value": [
+                f"{finite.sum():,}",
+                f"{mpc_bias:.6g}",
+                f"{mpc_rmse:.6g}",
+                f"{correlation:.6g}" if np.isfinite(correlation) else "NA",
+                f"{exact_response['check_state_clipped'].mean():.2%}",
+                f"{exact_response['exact_asset_state_clipped'].mean():.2%}",
+                f"{exact_response['exact_exogenous_state_mapped'].mean():.2%}",
+            ],
+        },
+        dtype="string",
+    )
+    subgroup = (
+        paired.groupby("population_type", as_index=False)
+        .agg(
+            n=("model_mpc", "size"),
+            model_mean_mpc=("model_mpc", "mean"),
+            surrogate_mean_mpc=("surrogate_mpc", "mean"),
+            mean_error=("error", "mean"),
+            rmse=("error", lambda x: float(np.sqrt(np.mean(np.asarray(x) ** 2)))),
+        )
+        .sort_values("model_mean_mpc", ascending=False)
+    )
+    with st.expander("Paired MPC diagnostics", expanded=False):
+        st.dataframe(paired_summary, hide_index=True, use_container_width=True)
+        st.dataframe(subgroup, hide_index=True, use_container_width=True)
+        st.download_button(
+            "Download paired household MPCs as CSV",
+            data=paired.to_csv(index=False).encode("utf-8"),
+            file_name="exact_model_vs_surrogate_mpcs.csv",
+            mime="text/csv",
+            key="download_exact_surrogate_mpcs",
         )
 
 
@@ -1726,7 +1977,7 @@ def _validation_page(bundle: PolicySurrogateBundle) -> None:
         "asset changes are reconstructed from the accounting equations. Asset "
         "rows include persistence or zero-change benchmarks."
     )
-    st.dataframe(bundle.validation_metrics, hide_index=True, width="stretch")
+    st.dataframe(bundle.validation_metrics, hide_index=True, use_container_width=True)
     metrics = bundle.validation_metrics
     fig = go.Figure()
     fig.add_trace(
@@ -1754,7 +2005,7 @@ def _validation_page(bundle: PolicySurrogateBundle) -> None:
         xaxis_title="Policy choice",
         barmode="group",
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
     if "skill_vs_benchmark" in metrics:
         skill = metrics[metrics["skill_vs_benchmark"].notna()]
@@ -1774,7 +2025,7 @@ def _validation_page(bundle: PolicySurrogateBundle) -> None:
                 xaxis_title="Policy choice",
                 title="Improvement over persistence or zero change",
             )
-            st.plotly_chart(fig_skill, width="stretch")
+            st.plotly_chart(fig_skill, use_container_width=True)
 
     if not bundle.validation_by_model.empty:
         st.subheader("Error distribution across held-out models")
@@ -1789,8 +2040,8 @@ def _validation_page(bundle: PolicySurrogateBundle) -> None:
         ].sort_values("rmse")
         fig2 = go.Figure(go.Box(y=d["rmse"], boxpoints="all", name=_pretty(chosen)))
         fig2.update_layout(template="plotly_white", height=430, yaxis_title="RMSE")
-        st.plotly_chart(fig2, width="stretch")
-        st.dataframe(d, hide_index=True, width="stretch")
+        st.plotly_chart(fig2, use_container_width=True)
+        st.dataframe(d, hide_index=True, use_container_width=True)
 
 
 def main() -> None:
@@ -1862,6 +2113,7 @@ def main() -> None:
             "Two-dimensional surfaces",
             "MPC distribution",
             "Grid versus polynomial",
+            "MPCs: grid versus polynomial",
             "Validation",
         ]
     )
@@ -1895,6 +2147,13 @@ def main() -> None:
         )
 
     with tabs[4]:
+        _mpc_grid_comparison_page(
+            bundle,
+            base,
+            bundle_path=bundle_path,
+        )
+
+    with tabs[5]:
         _validation_page(bundle)
 
 

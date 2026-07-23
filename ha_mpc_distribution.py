@@ -14,6 +14,7 @@ employment, and illiquid-asset states.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -73,10 +74,7 @@ class PopulationAssumptions:
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be between zero and one.")
-        if (
-            self.poor_hand_to_mouth_share + self.wealthy_hand_to_mouth_share
-            > 1.0 + EPS
-        ):
+        if self.poor_hand_to_mouth_share + self.wealthy_hand_to_mouth_share > 1.0 + EPS:
             raise ValueError(
                 "poor_hand_to_mouth_share + wealthy_hand_to_mouth_share "
                 "cannot exceed one."
@@ -196,9 +194,7 @@ def infer_money_unit_info(
             except Exception:
                 pass
 
-    if units == "data" or (
-        np.isfinite(income_median_f) and income_median_f > 1_000.0
-    ):
+    if units == "data" or (np.isfinite(income_median_f) and income_median_f > 1_000.0):
         return MoneyUnitInfo("data", 1.0, "income-level heuristic")
     return MoneyUnitInfo(
         "model",
@@ -375,8 +371,7 @@ def generate_synthetic_population(
     poor = draw < assumptions.poor_hand_to_mouth_share
     wealthy_htm = (draw >= assumptions.poor_hand_to_mouth_share) & (
         draw
-        < assumptions.poor_hand_to_mouth_share
-        + assumptions.wealthy_hand_to_mouth_share
+        < assumptions.poor_hand_to_mouth_share + assumptions.wealthy_hand_to_mouth_share
     )
     regular = ~(poor | wealthy_htm)
 
@@ -458,15 +453,15 @@ def generate_synthetic_population(
             zero_needles=("not_retired", "working_age", "false"),
             one_needles=("retired", "true"),
         )
-        frame["is_retired"] = np.where(
-            retired, retired_value, not_retired_value
-        )
+        frame["is_retired"] = np.where(retired, retired_value, not_retired_value)
 
     # Other categorical features are held at the selected/base category.
     for column in bundle.feature_spec.categorical_columns:
         if column in frame:
             continue
-        frame[column] = str(base.get(column, bundle.feature_ranges[column].get("mode", "0")))
+        frame[column] = str(
+            base.get(column, bundle.feature_ranges[column].get("mode", "0"))
+        )
 
     # Apply the selected continuous and categorical parameters, then rebuild
     # labor income, pension income, taxes, and after-tax income using the same
@@ -512,7 +507,9 @@ def generate_synthetic_population(
     frame["liquid_assets_dollars_unclipped"] = liquid_assets_dollars
     frame["illiquid_assets_dollars_unclipped"] = illiquid_assets_dollars
     if clipping_flags:
-        frame["state_clipped_to_training_support"] = np.logical_or.reduce(clipping_flags)
+        frame["state_clipped_to_training_support"] = np.logical_or.reduce(
+            clipping_flags
+        )
     else:
         frame["state_clipped_to_training_support"] = False
     frame["household_weight"] = 1.0 / n
@@ -554,6 +551,453 @@ def set_parameter_values(
     return bundle.prepare_inputs(out) if recompute_after_tax else out
 
 
+@dataclass(frozen=True)
+class ExactPolicyGrid:
+    """Consumption policy and state grids from one solved HA model.
+
+    The consumption tensor is stored in canonical ``G,H,K,E,B,A`` order.
+    Exact-grid MPCs interpolate over the two asset dimensions and use the
+    nearest solved age, persistent-income, group, and employment states.
+    """
+
+    model_dir: Path
+    metadata: dict[str, Any]
+    consumption: np.ndarray
+    group_values: np.ndarray
+    ages: np.ndarray
+    log_income_grid: np.ndarray
+    liquid_grid: np.ndarray
+    illiquid_grid: np.ndarray
+    gross_income: np.ndarray
+    after_tax_income: np.ndarray
+    money_scale: float
+    retirement_age: float
+
+
+def _canonical_policy_array(array: np.ndarray, layout: str) -> np.ndarray:
+    """Return a policy tensor in canonical GHKEBA order."""
+
+    layout = str(layout).upper()
+    arr = np.asarray(array)
+    if len(layout) == 5:
+        arr = arr[None, ...]
+        layout = "G" + layout
+    if len(layout) != 6 or set(layout) != set("GHKEBA"):
+        raise ValueError(f"Unsupported policy layout {layout!r}.")
+    permutation = [layout.index(axis) for axis in "GHKEBA"]
+    return np.transpose(arr, permutation)
+
+
+def _canonical_state_array(
+    array: np.ndarray,
+    *,
+    g_count: int,
+    h_count: int,
+    k_count: int,
+    e_count: int,
+    name: str,
+) -> np.ndarray:
+    """Return a state-income array in canonical G,H,K,E order."""
+
+    arr = np.asarray(array, dtype=float)
+    if arr.shape == (g_count, h_count, k_count, e_count):
+        return arr
+    if arr.shape == (h_count, k_count, e_count) and g_count == 1:
+        return arr[None, ...]
+    if arr.shape == (g_count, h_count, k_count):
+        return np.repeat(arr[..., None], e_count, axis=3)
+    if arr.shape == (h_count, k_count) and g_count == 1:
+        expanded = arr[None, ..., None]
+        return np.repeat(expanded, e_count, axis=3)
+    raise ValueError(
+        f"{name} has shape {arr.shape}; expected G,H,K,E = "
+        f"{(g_count, h_count, k_count, e_count)}."
+    )
+
+
+def load_exact_policy_grid(
+    model_dir: str | Path,
+    *,
+    policy_layout: str = "GHKEBA",
+) -> ExactPolicyGrid:
+    """Load the exact consumption policy needed for MPC comparisons."""
+
+    directory = Path(model_dir).expanduser().resolve()
+    metadata_path = directory / "metadata.json"
+    arrays_path = directory / "arrays.npz"
+    if not metadata_path.exists() or not arrays_path.exists():
+        raise FileNotFoundError(
+            f"Expected metadata.json and arrays.npz under {directory}."
+        )
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    with np.load(arrays_path, allow_pickle=False) as npz:
+        required = {
+            "consumption",
+            "liquid_grid",
+            "illiquid_grid",
+            "log_income_grid",
+            "gross_income",
+            "after_tax_income",
+        }
+        missing = sorted(required.difference(npz.files))
+        if missing:
+            raise KeyError(
+                f"Exact MPC comparison is missing arrays {missing} in {arrays_path}."
+            )
+        consumption = _canonical_policy_array(
+            npz["consumption"],
+            policy_layout,
+        ).astype(float, copy=False)
+        group_values = np.asarray(
+            npz["group_values"]
+            if "group_values" in npz.files
+            else np.arange(consumption.shape[0])
+        )
+        ages = np.asarray(
+            npz["ages"] if "ages" in npz.files else np.arange(consumption.shape[1]),
+            dtype=float,
+        )
+        log_income_grid = np.asarray(npz["log_income_grid"], dtype=float)
+        liquid_grid = np.asarray(npz["liquid_grid"], dtype=float)
+        illiquid_grid = np.asarray(npz["illiquid_grid"], dtype=float)
+        gross_raw = np.asarray(npz["gross_income"], dtype=float)
+        after_tax_raw = np.asarray(npz["after_tax_income"], dtype=float)
+
+    G, H, K, E, B, A = consumption.shape
+    if len(group_values) != G:
+        raise ValueError(
+            f"group_values has length {len(group_values)}, but consumption has G={G}."
+        )
+    if len(ages) != H:
+        raise ValueError(f"ages has length {len(ages)}, but consumption has H={H}.")
+    if len(liquid_grid) != B or len(illiquid_grid) != A:
+        raise ValueError(
+            "Asset-grid lengths do not match the consumption tensor: "
+            f"B={B} vs {len(liquid_grid)}, A={A} vs {len(illiquid_grid)}."
+        )
+    if log_income_grid.ndim == 1:
+        log_income_grid = np.repeat(log_income_grid[None, :], G, axis=0)
+    if log_income_grid.shape != (G, K):
+        raise ValueError(
+            f"log_income_grid has shape {log_income_grid.shape}; expected {(G, K)}."
+        )
+
+    gross_income = _canonical_state_array(
+        gross_raw,
+        g_count=G,
+        h_count=H,
+        k_count=K,
+        e_count=E,
+        name="gross_income",
+    )
+    after_tax_income = _canonical_state_array(
+        after_tax_raw,
+        g_count=G,
+        h_count=H,
+        k_count=K,
+        e_count=E,
+        name="after_tax_income",
+    )
+    config = metadata.get("config", {}) or {}
+    money_scale = float(metadata.get("money_scale", 1.0) or 1.0)
+    if not np.isfinite(money_scale) or money_scale <= 0.0:
+        raise ValueError(f"Invalid money_scale={money_scale!r} in {metadata_path}.")
+
+    return ExactPolicyGrid(
+        model_dir=directory,
+        metadata=metadata,
+        consumption=consumption,
+        group_values=group_values,
+        ages=ages,
+        log_income_grid=log_income_grid,
+        liquid_grid=liquid_grid,
+        illiquid_grid=illiquid_grid,
+        gross_income=gross_income,
+        after_tax_income=after_tax_income,
+        money_scale=money_scale,
+        retirement_age=float(config.get("retirement_age", np.inf)),
+    )
+
+
+def _nearest_indices(grid: np.ndarray, values: np.ndarray) -> np.ndarray:
+    grid = np.asarray(grid, dtype=float)
+    values = np.asarray(values, dtype=float)
+    right = np.searchsorted(grid, values, side="left")
+    right = np.clip(right, 0, len(grid) - 1)
+    left = np.clip(right - 1, 0, len(grid) - 1)
+    choose_right = np.abs(grid[right] - values) < np.abs(values - grid[left])
+    return np.where(choose_right, right, left).astype(np.int64)
+
+
+def _interpolation_indices(
+    grid: np.ndarray,
+    values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    grid = np.asarray(grid, dtype=float)
+    values = np.asarray(values, dtype=float)
+    right = np.searchsorted(grid, values, side="left")
+    right = np.clip(right, 0, len(grid) - 1)
+    left = np.clip(right - 1, 0, len(grid) - 1)
+    same = left == right
+    denominator = np.maximum(grid[right] - grid[left], EPS)
+    weight = np.where(same, 0.0, (values - grid[left]) / denominator)
+    return left.astype(np.int64), right.astype(np.int64), np.clip(weight, 0.0, 1.0)
+
+
+def _employment_indices(values: pd.Series, e_count: int) -> np.ndarray:
+    numeric = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    missing = ~np.isfinite(numeric)
+    if missing.any():
+        text = values.astype(str).str.lower().str.replace("-", "_", regex=False)
+        nonemployed = text.str.contains(
+            "unemployed|nonemployed|not_working|retired|inactive",
+            regex=True,
+        ).to_numpy()
+        numeric[missing] = nonemployed[missing].astype(float)
+    return np.clip(np.rint(numeric), 0, e_count - 1).astype(np.int64)
+
+
+def _group_indices(values: pd.Series, group_values: np.ndarray) -> np.ndarray:
+    lookup = {str(value): index for index, value in enumerate(group_values)}
+    result = np.empty(len(values), dtype=np.int64)
+    numeric_groups = None
+    try:
+        numeric_groups = np.asarray(group_values, dtype=float)
+    except (TypeError, ValueError):
+        pass
+    for i, value in enumerate(values):
+        match = lookup.get(str(value))
+        if match is not None:
+            result[i] = int(match)
+            continue
+        if numeric_groups is not None:
+            try:
+                result[i] = int(np.argmin(np.abs(numeric_groups - float(value))))
+                continue
+            except (TypeError, ValueError):
+                pass
+        result[i] = 0
+    return result
+
+
+def align_population_to_exact_grid(
+    exact_grid: ExactPolicyGrid,
+    population: pd.DataFrame,
+    *,
+    money_units: str = "model",
+) -> pd.DataFrame:
+    """Map arbitrary population draws to the exact model's exogenous states.
+
+    Assets remain continuous (subject to exact-grid bounds), while age, group,
+    employment, and persistent income are mapped to their nearest solved states.
+    The returned frame is appropriate for evaluating both the exact grid and the
+    surrogate, ensuring that the comparison uses identical economic states.
+    """
+
+    if money_units not in {"model", "data"}:
+        raise ValueError("money_units must be 'model' or 'data'.")
+    required = {"age", "liquid_assets", "illiquid_assets"}
+    missing = sorted(required.difference(population.columns))
+    if missing:
+        raise KeyError(f"Population is missing required columns: {missing}")
+
+    out = population.copy().reset_index(drop=True)
+    n = len(out)
+    G, H, K, E, _, _ = exact_grid.consumption.shape
+    factor = 1.0 if money_units == "model" else exact_grid.money_scale
+
+    education = out.get("education", pd.Series(np.zeros(n), index=out.index))
+    g = _group_indices(pd.Series(education), exact_grid.group_values)
+    age_raw = (
+        pd.to_numeric(out["age"], errors="coerce")
+        .fillna(float(np.median(exact_grid.ages)))
+        .to_numpy(dtype=float)
+    )
+    h = _nearest_indices(exact_grid.ages, age_raw)
+
+    employment = out.get(
+        "employment_state",
+        pd.Series(np.zeros(n), index=out.index),
+    )
+    e = _employment_indices(pd.Series(employment), E)
+
+    labor_grid = np.exp(exact_grid.log_income_grid) * factor
+    if "labor_income_state" in out:
+        labor_raw = pd.to_numeric(out["labor_income_state"], errors="coerce").to_numpy(
+            dtype=float
+        )
+    elif "current_income" in out:
+        labor_raw = pd.to_numeric(out["current_income"], errors="coerce").to_numpy(
+            dtype=float
+        )
+    else:
+        labor_raw = np.full(n, np.nan)
+    k = np.empty(n, dtype=np.int64)
+    for group in np.unique(g):
+        mask = g == group
+        fallback = float(np.median(labor_grid[group]))
+        values = np.where(np.isfinite(labor_raw[mask]), labor_raw[mask], fallback)
+        k[mask] = _nearest_indices(labor_grid[group], values)
+
+    liquid_grid = exact_grid.liquid_grid * factor
+    illiquid_grid = exact_grid.illiquid_grid * factor
+    liquid_raw = (
+        pd.to_numeric(out["liquid_assets"], errors="coerce")
+        .fillna(0.0)
+        .to_numpy(dtype=float)
+    )
+    illiquid_raw = (
+        pd.to_numeric(out["illiquid_assets"], errors="coerce")
+        .fillna(float(illiquid_grid[0]))
+        .to_numpy(dtype=float)
+    )
+    liquid = np.clip(liquid_raw, liquid_grid[0], liquid_grid[-1])
+    illiquid = np.clip(illiquid_raw, illiquid_grid[0], illiquid_grid[-1])
+
+    out["education"] = exact_grid.group_values[g]
+    out["age"] = exact_grid.ages[h]
+    out["employment_state"] = e
+    out["is_retired"] = (exact_grid.ages[h] >= exact_grid.retirement_age).astype(int)
+    out["labor_income_state"] = labor_grid[g, k]
+    out["current_income"] = exact_grid.gross_income[g, h, k, e] * factor
+    out["gross_income"] = out["current_income"]
+    out["after_tax_income"] = exact_grid.after_tax_income[g, h, k, e] * factor
+    out["liquid_assets"] = liquid
+    out["illiquid_assets"] = illiquid
+    out["liquid_grid_min"] = float(liquid_grid[0])
+    out["liquid_grid_max"] = float(liquid_grid[-1])
+    out["illiquid_grid_min"] = float(illiquid_grid[0])
+    out["illiquid_grid_max"] = float(illiquid_grid[-1])
+    out["money_scale"] = exact_grid.money_scale
+    out["exact_state_g"] = g
+    out["exact_state_h"] = h
+    out["exact_state_k"] = k
+    out["exact_state_e"] = e
+    out["exact_exogenous_state_mapped"] = (
+        (np.abs(age_raw - exact_grid.ages[h]) > 1.0e-10)
+        | (~np.isfinite(labor_raw))
+        | (
+            np.abs(
+                np.where(np.isfinite(labor_raw), labor_raw, out["labor_income_state"])
+                - out["labor_income_state"].to_numpy(dtype=float)
+            )
+            > 1.0e-10
+        )
+    )
+    out["exact_asset_state_clipped"] = (np.abs(liquid - liquid_raw) > 1.0e-10) | (
+        np.abs(illiquid - illiquid_raw) > 1.0e-10
+    )
+    return complete_derived_state(out)
+
+
+def predict_exact_grid_consumption(
+    exact_grid: ExactPolicyGrid,
+    aligned_population: pd.DataFrame,
+    *,
+    liquid_asset_increment: float = 0.0,
+    money_units: str = "model",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate exact-grid consumption with bilinear asset interpolation."""
+
+    if money_units not in {"model", "data"}:
+        raise ValueError("money_units must be 'model' or 'data'.")
+    factor = 1.0 if money_units == "model" else exact_grid.money_scale
+    liquid_grid = exact_grid.liquid_grid * factor
+    illiquid_grid = exact_grid.illiquid_grid * factor
+
+    required_indices = [
+        "exact_state_g",
+        "exact_state_h",
+        "exact_state_k",
+        "exact_state_e",
+    ]
+    if any(column not in aligned_population for column in required_indices):
+        aligned_population = align_population_to_exact_grid(
+            exact_grid,
+            aligned_population,
+            money_units=money_units,
+        )
+
+    g = aligned_population["exact_state_g"].to_numpy(dtype=np.int64)
+    h = aligned_population["exact_state_h"].to_numpy(dtype=np.int64)
+    k = aligned_population["exact_state_k"].to_numpy(dtype=np.int64)
+    e = aligned_population["exact_state_e"].to_numpy(dtype=np.int64)
+    b_raw = pd.to_numeric(
+        aligned_population["liquid_assets"], errors="coerce"
+    ).to_numpy(dtype=float) + float(liquid_asset_increment)
+    a_raw = pd.to_numeric(
+        aligned_population["illiquid_assets"], errors="coerce"
+    ).to_numpy(dtype=float)
+    b = np.clip(b_raw, liquid_grid[0], liquid_grid[-1])
+    a = np.clip(a_raw, illiquid_grid[0], illiquid_grid[-1])
+
+    ib0, ib1, wb = _interpolation_indices(liquid_grid, b)
+    ia0, ia1, wa = _interpolation_indices(illiquid_grid, a)
+    policy = exact_grid.consumption * factor
+    v00 = policy[g, h, k, e, ib0, ia0]
+    v10 = policy[g, h, k, e, ib1, ia0]
+    v01 = policy[g, h, k, e, ib0, ia1]
+    v11 = policy[g, h, k, e, ib1, ia1]
+    consumption = (
+        (1.0 - wb) * (1.0 - wa) * v00
+        + wb * (1.0 - wa) * v10
+        + (1.0 - wb) * wa * v01
+        + wb * wa * v11
+    )
+    clipped = np.abs(b - b_raw) > 1.0e-12
+    return np.asarray(consumption, dtype=float), clipped
+
+
+def compute_exact_grid_check_mpcs(
+    exact_grid: ExactPolicyGrid,
+    population: pd.DataFrame,
+    *,
+    check_amount_dollars: float = 10_000.0,
+    dollars_per_model_unit: float = 53_000.0,
+    money_units: str = "model",
+) -> pd.DataFrame:
+    """Compute check MPCs from the solved model's exact consumption grid."""
+
+    if check_amount_dollars <= 0.0 or not np.isfinite(check_amount_dollars):
+        raise ValueError("check_amount_dollars must be finite and positive.")
+    if dollars_per_model_unit <= 0.0 or not np.isfinite(dollars_per_model_unit):
+        raise ValueError("dollars_per_model_unit must be finite and positive.")
+    check_units = (
+        float(check_amount_dollars) / float(dollars_per_model_unit)
+        if money_units == "model"
+        else float(check_amount_dollars)
+    )
+    aligned = align_population_to_exact_grid(
+        exact_grid,
+        population,
+        money_units=money_units,
+    )
+    baseline_c, baseline_clipped = predict_exact_grid_consumption(
+        exact_grid,
+        aligned,
+        liquid_asset_increment=0.0,
+        money_units=money_units,
+    )
+    treated_c, treated_clipped = predict_exact_grid_consumption(
+        exact_grid,
+        aligned,
+        liquid_asset_increment=check_units,
+        money_units=money_units,
+    )
+    response = treated_c - baseline_c
+    out = aligned.copy()
+    out["baseline_consumption"] = baseline_c
+    out["post_check_consumption"] = treated_c
+    out["consumption_response"] = response
+    out["mpc"] = response / check_units
+    out["check_amount_dollars"] = float(check_amount_dollars)
+    out["check_amount_model_units"] = check_units
+    out["check_state_clipped"] = treated_clipped
+    out["baseline_state_clipped"] = baseline_clipped
+    return out
+
+
 def compute_check_mpcs(
     bundle: PolicySurrogateBundle,
     population: pd.DataFrame,
@@ -589,9 +1033,9 @@ def compute_check_mpcs(
     # parameters before evaluating either state.
     baseline = bundle.prepare_inputs(population.copy())
     treated = baseline.copy()
-    liquid_before = pd.to_numeric(
-        baseline["liquid_assets"], errors="coerce"
-    ).to_numpy(dtype=float)
+    liquid_before = pd.to_numeric(baseline["liquid_assets"], errors="coerce").to_numpy(
+        dtype=float
+    )
     liquid_after_raw = liquid_before + check_units
     liquid_after = liquid_after_raw.copy()
 
@@ -699,9 +1143,15 @@ def plot_mpc_distribution(
 
     fig, ax = plt.subplots(figsize=(8.5, 5.5))
     for values, label in zip(arrays, labels):
-        ax.hist(values, bins=edges, density=True, histtype="step", linewidth=2, label=label)
-    ax.axvline(float(np.mean(current)), linestyle="--", linewidth=1.5, label="Current mean")
-    ax.axvline(float(np.median(current)), linestyle=":", linewidth=1.5, label="Current median")
+        ax.hist(
+            values, bins=edges, density=True, histtype="step", linewidth=2, label=label
+        )
+    ax.axvline(
+        float(np.mean(current)), linestyle="--", linewidth=1.5, label="Current mean"
+    )
+    ax.axvline(
+        float(np.median(current)), linestyle=":", linewidth=1.5, label="Current median"
+    )
     ax.set_xlabel("Marginal propensity to consume")
     ax.set_ylabel("Density")
     ax.set_title(title)
