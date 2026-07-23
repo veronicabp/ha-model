@@ -1,0 +1,134 @@
+{
+  "config": {
+    "age_col": "age",
+    "allow_borrowing": true,
+    "borrowing_interest_rate": 0.15,
+    "borrowing_limit": 0.0,
+    "consumption_floor": 1e-08,
+    "ct_automatic_illiquid_income_share": 0.0,
+    "ct_convergence_tol": 1e-05,
+    "ct_convex_adjustment_cost": 0.5,
+    "ct_delta_base": 0.5,
+    "ct_delta_max": 100000000.0,
+    "ct_discount_rate": null,
+    "ct_illiquid_cost_floor": 1e-06,
+    "ct_linear_adjustment_cost": 0.1,
+    "ct_max_iterations": 20,
+    "ct_policy_drift_clip": 10000.0,
+    "ct_slow_iterations": 20,
+    "ct_time_step": 1.0,
+    "current_income_col": "current_income",
+    "dense_liquid_upper": 0.75,
+    "discount_factor": 0.95,
+    "education_col": "education",
+    "empirical_min_cell_count": 25,
+    "empirical_transition_smoothing": 0.001,
+    "employed_col": "employed",
+    "employment_state_col": "employment_state",
+    "gross_income_col": "gross_income",
+    "group_col": "group",
+    "id_col": "household_id",
+    "illiquid_col": "illiquid_assets",
+    "illiquid_grid_size": 15,
+    "illiquid_interest_rate": 0.04,
+    "illiquid_max": 5.0,
+    "illiquid_min": 1e-06,
+    "illiquid_service_flow": 0.0,
+    "income_grid_size": 12,
+    "income_state_col": "income_state",
+    "labor_income_col": "labor_income",
+    "liquid_col": "liquid_assets",
+    "liquid_grid_size": 100,
+    "liquid_interest_rate": 0.0,
+    "liquid_max": 8.0,
+    "liquid_service_flow": 0.0,
+    "max_age": 80,
+    "min_age": 25,
+    "normalize_empirical_money": true,
+    "pension_col": "pension_income",
+    "potential_labor_col": "potential_labor_income",
+    "retirement_age": 65,
+    "risk_aversion": 4.0,
+    "seed": 12345,
+    "taxes_col": "taxes",
+    "unemployment_col": "unemployment_benefits",
+    "year_col": "year"
+  },
+  "diagnostics": {
+    "max_distance": 9.801490165273208e-06,
+    "max_iterations": 10,
+    "message": "",
+    "model_id": "bb026fcb2367ad",
+    "status": "success"
+  },
+  "metadata": {
+    "chi0": 0.1,
+    "chi1": 0.5,
+    "ra_ct": 0.039220713153281295,
+    "rb_neg_ct": 0.13976194237515868,
+    "rb_pos_ct": 0.0,
+    "rho_ct": 0.05129329438755058,
+    "xi": 0.0
+  },
+  "money_scale": 1.0,
+  "policy_bundle_metadata": {
+    "source": "parametric",
+    "spec": {
+      "bundle_path": null,
+      "employment": {
+        "finding_income_slope": 0.0,
+        "job_finding_probability": 0.85,
+        "job_loss_probability": 0.02,
+        "kind": "constant",
+        "loss_income_slope": 0.0,
+        "name": "emp_loss0.020_find0.85",
+        "retirement_absorbing": true,
+        "unemployment_replacement_rate": 0.3
+      },
+      "group_values": [
+        0
+      ],
+      "income": {
+        "age_profile_quadratic": -0.1,
+        "age_profile_slope": 0.4,
+        "group_log_income_shifters": [
+          0.0
+        ],
+        "innovation_std": 0.1,
+        "kind": "rouwenhorst",
+        "mean_income": 1.0,
+        "name": "income_rho0.90_sig0.10",
+        "persistence": 0.9
+      },
+      "name": "income_rho0.90_sig0.10__emp_loss0.020_find0.85__tax_flat_flat0.08_prog0.05__pension_rr0.65",
+      "pension": {
+        "kind": "replacement_rate",
+        "name": "pension_rr0.65",
+        "pension_taxable": true,
+        "replacement_rate": 0.65
+      },
+      "source": "parametric",
+      "tax": {
+        "deduction": 0.2,
+        "flat_rate": 0.08,
+        "kind": "flat",
+        "name": "tax_flat_flat0.08_prog0.05",
+        "payroll_rate": 0.08,
+        "progressive_exponent": 1.35,
+        "progressive_rate": 0.05,
+        "tax_cap": 0.95
+      }
+    }
+  },
+  "policy_bundle_name": "income_rho0.90_sig0.10__emp_loss0.020_find0.85__tax_flat_flat0.08_prog0.05__pension_rr0.65",
+  "saved_arrays": {
+    "drifts_saved": false,
+    "dtype": "float32",
+    "policy_arrays": [
+      "consumption",
+      "deposit"
+    ],
+    "transitions": true,
+    "value": false
+  }
+}

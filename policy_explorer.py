@@ -98,9 +98,8 @@ def _load_exact_policy_grid_cached(
     )
 
 
-@st.cache_data(show_spinner=False)
-def _load_training_sample(bundle_path: str) -> pd.DataFrame:
-    """Load the sampled grid data saved beside the surrogate bundle."""
+def _training_sample_path(bundle_path: str | Path) -> Path | None:
+    """Return the sampled-policy file stored beside the fitted bundle."""
 
     parent = Path(bundle_path).expanduser().resolve().parent
     candidates = [
@@ -109,12 +108,15 @@ def _load_training_sample(bundle_path: str) -> pd.DataFrame:
         parent / "policy_grid_sample.pkl",
         parent / "policy_grid_sample.csv",
     ]
+    return next((path for path in candidates if path.exists()), None)
 
-    for path in candidates:
-        if path.exists():
-            return read_policy_dataset(path)
 
-    return pd.DataFrame()
+@st.cache_data(show_spinner=False)
+def _load_training_sample(bundle_path: str) -> pd.DataFrame:
+    """Load the sampled grid data saved beside the surrogate bundle."""
+
+    path = _training_sample_path(bundle_path)
+    return read_policy_dataset(path) if path is not None else pd.DataFrame()
 
 
 @st.cache_data(show_spinner=False)
@@ -209,15 +211,12 @@ def _out_of_sample_model_summary(
         subset=["model_id"]
     )
 
-    # Keep only held-out models explicitly present in model_catalog.csv.
     summary = summary.merge(
         catalog_small,
         on="model_id",
         how="inner",
         validate="one_to_one",
     )
-
-    # Also exclude catalog rows without a usable model directory value.
     summary = summary[
         summary["model_dir"].notna()
         & summary["model_dir"].astype(str).str.strip().ne("")
@@ -358,10 +357,22 @@ def _continuous_plot_columns(
         "years_to_retirement",
     }
 
-    return [
+    columns = [
         column
         for column in columns
         if column in bundle.feature_ranges and column not in excluded
+    ]
+
+    preferred = [
+        "current_income",
+        "age",
+        "labor_income_state",
+        "liquid_assets",
+        "illiquid_assets",
+    ]
+
+    return [column for column in preferred if column in columns] + [
+        column for column in columns if column not in preferred
     ]
 
 
@@ -772,6 +783,7 @@ def _one_dimensional_page(
         if linked_columns
         else "No labor-income state is included in this model"
     )
+
     linked_income_requested = st.checkbox(
         linked_label,
         value=bool(linked_columns),
@@ -1374,30 +1386,8 @@ def _held_out_model_selector(
         catalog = _load_model_catalog(str(bundle_path))
         model_summary = _out_of_sample_model_summary(bundle, catalog)
     except Exception as exc:
-        import platform
-        import traceback
-
-        import joblib
-        import numpy
-        import scipy
-        import sklearn
-
-        st.exception(exc)
-
-        st.code(traceback.format_exc())
-
-        st.write(
-            {
-                "python": platform.python_version(),
-                "numpy": numpy.__version__,
-                "scipy": scipy.__version__,
-                "scikit_learn": sklearn.__version__,
-                "joblib": joblib.__version__,
-                "surrogate_module": __import__("ha_policy_surrogate").__file__,
-            }
-        )
-
-        st.stop()
+        st.error(str(exc))
+        return None
 
     display_summary = model_summary[
         ["model_id", "consumption_r2", "deposit_r2", "mean_r2"]
@@ -2008,7 +1998,702 @@ def _mpc_grid_comparison_page(
         )
 
 
-def _validation_page(bundle: PolicySurrogateBundle) -> None:
+def _held_out_model_ids(bundle: PolicySurrogateBundle) -> set[str]:
+    """Return the model IDs reserved for untouched validation."""
+
+    for key in ("test_models", "validation_models"):
+        values = bundle.training_metadata.get(key)
+        if values:
+            return {str(value) for value in values}
+
+    metrics = bundle.validation_by_model
+    if metrics.empty or "model_id" not in metrics:
+        return set()
+
+    held_out = metrics.copy()
+    if "split" in held_out:
+        held_out = held_out[
+            held_out["split"].astype(str).str.contains("held_out", case=False, na=False)
+        ]
+    return set(held_out["model_id"].astype(str))
+
+
+def _mpc_validation_columns(
+    bundle: PolicySurrogateBundle,
+    frame: pd.DataFrame,
+) -> list[str]:
+    """Continuous states and parameters suitable for the MPC binscatter."""
+
+    preferred = [
+        "age",
+        "years_to_terminal",
+        "years_since_retirement",
+        "years_to_retirement_positive",
+        "current_income",
+        "after_tax_income",
+        "labor_income_state",
+        "liquid_assets",
+        "illiquid_assets",
+        "liquid_slack",
+        "liquid_slack_to_income",
+        "illiquid_assets_to_income",
+        "cash_on_hand_to_income",
+        "mpc_check_units",
+    ]
+    preferred += [
+        column
+        for column in bundle.feature_spec.parameter_columns
+        if not column.endswith("__missing")
+    ]
+    preferred += list(getattr(bundle.feature_spec, "engineered_state_columns", ()))
+
+    blocked = {
+        "mpc_pair_id",
+        "mpc_pair_role",
+        "grid_g",
+        "grid_h",
+        "grid_k",
+        "grid_e",
+        "grid_b",
+        "grid_a",
+    }
+    out: list[str] = []
+    for column in dict.fromkeys(preferred):
+        if column in blocked or column not in frame:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if values.notna().sum() >= 2 and values.nunique(dropna=True) > 1:
+            out.append(column)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def _load_holdout_mpc_validation(
+    bundle_path: str,
+    bundle_signature: int,
+    sample_path: str,
+    sample_signature: int,
+    prediction_chunk_size: int = 20_000,
+) -> pd.DataFrame:
+    """Construct exact and surrogate MPCs from held-out sampled grid pairs."""
+
+    # Signatures are included only to invalidate the Streamlit cache whenever
+    # either file is replaced at the same path.
+    del bundle_signature, sample_signature
+
+    bundle = PolicySurrogateBundle.load(bundle_path)
+    sample = read_policy_dataset(sample_path)
+
+    required = {
+        "model_id",
+        "mpc_pair_id",
+        "mpc_pair_role",
+        "mpc_check_units",
+        "consumption",
+    }
+    missing = required.difference(sample.columns)
+    if missing:
+        raise ValueError(
+            "policy_grid_sample is missing MPC-pair columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    held_out_ids = _held_out_model_ids(bundle)
+    if not held_out_ids:
+        raise ValueError("The bundle does not identify any held-out model IDs.")
+
+    sample = sample.copy()
+    sample["model_id"] = sample["model_id"].astype(str)
+    pair_id = pd.to_numeric(sample["mpc_pair_id"], errors="coerce")
+    role = pd.to_numeric(sample["mpc_pair_role"], errors="coerce")
+    check = pd.to_numeric(sample["mpc_check_units"], errors="coerce")
+
+    keep = (
+        sample["model_id"].isin(held_out_ids)
+        & pair_id.ge(0)
+        & role.isin([0, 1])
+        & check.gt(0)
+    )
+    pair_rows = sample.loc[keep].copy().reset_index(drop=True)
+    del sample
+
+    if pair_rows.empty:
+        raise ValueError(
+            "No explicit MPC pairs were found for the held-out models. "
+            "Retrain with a positive --mpc-pair-share."
+        )
+
+    pair_rows["mpc_pair_id"] = pd.to_numeric(
+        pair_rows["mpc_pair_id"], errors="raise"
+    ).astype(np.int64)
+    pair_rows["mpc_pair_role"] = pd.to_numeric(
+        pair_rows["mpc_pair_role"], errors="raise"
+    ).astype(np.int8)
+
+    predicted = np.empty(len(pair_rows), dtype=float)
+    for start in range(0, len(pair_rows), int(prediction_chunk_size)):
+        stop = min(start + int(prediction_chunk_size), len(pair_rows))
+        chunk_prediction = bundle.predict(
+            pair_rows.iloc[start:stop],
+            project=True,
+        )
+        predicted[start:stop] = pd.to_numeric(
+            chunk_prediction["consumption"], errors="coerce"
+        ).to_numpy(dtype=float)
+    pair_rows["__surrogate_consumption"] = predicted
+
+    keys = ["model_id", "mpc_pair_id"]
+    baseline = (
+        pair_rows[pair_rows["mpc_pair_role"] == 0]
+        .sort_values(keys)
+        .drop_duplicates(keys, keep="first")
+        .rename(
+            columns={
+                "consumption": "true_consumption_baseline",
+                "__surrogate_consumption": "surrogate_consumption_baseline",
+                "mpc_check_units": "check_baseline",
+            }
+        )
+    )
+    treated = (
+        pair_rows[pair_rows["mpc_pair_role"] == 1][
+            keys + ["consumption", "__surrogate_consumption", "mpc_check_units"]
+        ]
+        .sort_values(keys)
+        .drop_duplicates(keys, keep="first")
+        .rename(
+            columns={
+                "consumption": "true_consumption_treated",
+                "__surrogate_consumption": "surrogate_consumption_treated",
+                "mpc_check_units": "check_treated",
+            }
+        )
+    )
+    del pair_rows
+
+    comparison = baseline.merge(
+        treated,
+        on=keys,
+        how="inner",
+        validate="one_to_one",
+    )
+    comparison["mpc_check_units"] = 0.5 * (
+        pd.to_numeric(comparison["check_baseline"], errors="coerce")
+        + pd.to_numeric(comparison["check_treated"], errors="coerce")
+    )
+    comparison["true_mpc"] = (
+        comparison["true_consumption_treated"] - comparison["true_consumption_baseline"]
+    ) / comparison["mpc_check_units"]
+    comparison["surrogate_mpc"] = (
+        comparison["surrogate_consumption_treated"]
+        - comparison["surrogate_consumption_baseline"]
+    ) / comparison["mpc_check_units"]
+    comparison["mpc_error"] = comparison["surrogate_mpc"] - comparison["true_mpc"]
+    comparison["absolute_mpc_error"] = comparison["mpc_error"].abs()
+    comparison["squared_mpc_error"] = comparison["mpc_error"] ** 2
+
+    finite = (
+        np.isfinite(pd.to_numeric(comparison["true_mpc"], errors="coerce"))
+        & np.isfinite(pd.to_numeric(comparison["surrogate_mpc"], errors="coerce"))
+        & np.isfinite(pd.to_numeric(comparison["mpc_check_units"], errors="coerce"))
+        & comparison["mpc_check_units"].gt(0)
+    )
+    comparison = comparison.loc[finite].reset_index(drop=True)
+    if comparison.empty:
+        raise ValueError("No finite held-out MPC comparisons could be constructed.")
+
+    # Recreate the exact engineered states used by the fitted surrogate at the
+    # baseline observation. This makes variables such as liquid slack / income
+    # available even though they are not necessarily stored in the sampled file.
+    prepared = bundle.prepare_inputs(comparison)
+    candidate_columns = list(
+        dict.fromkeys(
+            list(bundle.feature_spec.state_columns)
+            + list(getattr(bundle.feature_spec, "engineered_state_columns", ()))
+            + list(bundle.feature_spec.parameter_columns)
+            + list(bundle.feature_spec.categorical_state_columns)
+            + list(bundle.feature_spec.categorical_parameter_columns)
+            + [
+                "years_to_terminal",
+                "years_since_retirement",
+                "years_to_retirement_positive",
+                "after_tax_income",
+                "liquid_slack",
+                "liquid_slack_to_income",
+                "illiquid_assets_to_income",
+                "cash_on_hand_to_income",
+            ]
+        )
+    )
+    for column in candidate_columns:
+        if column in prepared:
+            comparison[column] = prepared[column].to_numpy()
+
+    keep_columns = list(
+        dict.fromkeys(
+            keys
+            + [
+                "mpc_check_units",
+                "true_mpc",
+                "surrogate_mpc",
+                "mpc_error",
+                "absolute_mpc_error",
+                "squared_mpc_error",
+            ]
+            + [column for column in candidate_columns if column in comparison]
+        )
+    )
+    return comparison[keep_columns].reset_index(drop=True)
+
+
+def _mpc_binscatter_table(
+    data: pd.DataFrame,
+    *,
+    x: str,
+    n_bins: int,
+    trim_share: float,
+    equal_weight_models: bool,
+) -> pd.DataFrame:
+    """Quantile bins with true MPC, surrogate MPC, bias, and RMSE."""
+
+    columns = [
+        "model_id",
+        x,
+        "true_mpc",
+        "surrogate_mpc",
+        "mpc_error",
+        "absolute_mpc_error",
+        "squared_mpc_error",
+    ]
+    frame = data[columns].copy()
+    for column in columns[1:]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.replace([np.inf, -np.inf], np.nan).dropna()
+    if frame.empty:
+        return pd.DataFrame()
+
+    unique_values = frame[x].nunique(dropna=True)
+    if trim_share > 0 and unique_values > int(n_bins):
+        lo, hi = frame[x].quantile([trim_share, 1.0 - trim_share])
+        frame = frame[frame[x].between(float(lo), float(hi))].copy()
+    if frame.empty:
+        return pd.DataFrame()
+
+    unique_values = frame[x].nunique(dropna=True)
+    if unique_values <= int(n_bins):
+        frame["__bin"] = frame[x]
+    else:
+        q = min(int(n_bins), int(unique_values))
+        frame["__bin"] = pd.qcut(frame[x], q=q, duplicates="drop")
+
+    if equal_weight_models:
+        model_bin = (
+            frame.groupby(["__bin", "model_id"], observed=True)
+            .agg(
+                x_mean=(x, "mean"),
+                x_min=(x, "min"),
+                x_max=(x, "max"),
+                true_mpc=("true_mpc", "mean"),
+                surrogate_mpc=("surrogate_mpc", "mean"),
+                mpc_error=("mpc_error", "mean"),
+                mean_absolute_error=("absolute_mpc_error", "mean"),
+                mean_squared_error=("squared_mpc_error", "mean"),
+                n_pairs=("true_mpc", "size"),
+            )
+            .reset_index()
+        )
+        grouped = model_bin.groupby("__bin", observed=True)
+        summary = grouped.agg(
+            x=("x_mean", "mean"),
+            x_min=("x_min", "min"),
+            x_max=("x_max", "max"),
+            true_mpc=("true_mpc", "mean"),
+            surrogate_mpc=("surrogate_mpc", "mean"),
+            mean_error=("mpc_error", "mean"),
+            mean_absolute_error=("mean_absolute_error", "mean"),
+            mean_squared_error=("mean_squared_error", "mean"),
+            true_sd=("true_mpc", "std"),
+            surrogate_sd=("surrogate_mpc", "std"),
+            error_sd=("mpc_error", "std"),
+            models=("model_id", "nunique"),
+            pairs=("n_pairs", "sum"),
+        ).reset_index(drop=True)
+        denominator = np.sqrt(summary["models"].clip(lower=1))
+    else:
+        grouped = frame.groupby("__bin", observed=True)
+        summary = grouped.agg(
+            x=(x, "mean"),
+            x_min=(x, "min"),
+            x_max=(x, "max"),
+            true_mpc=("true_mpc", "mean"),
+            surrogate_mpc=("surrogate_mpc", "mean"),
+            mean_error=("mpc_error", "mean"),
+            mean_absolute_error=("absolute_mpc_error", "mean"),
+            mean_squared_error=("squared_mpc_error", "mean"),
+            true_sd=("true_mpc", "std"),
+            surrogate_sd=("surrogate_mpc", "std"),
+            error_sd=("mpc_error", "std"),
+            models=("model_id", "nunique"),
+            pairs=("true_mpc", "size"),
+        ).reset_index(drop=True)
+        denominator = np.sqrt(summary["pairs"].clip(lower=1))
+
+    summary["rmse"] = np.sqrt(summary["mean_squared_error"])
+    summary["true_se"] = summary["true_sd"].fillna(0.0) / denominator
+    summary["surrogate_se"] = summary["surrogate_sd"].fillna(0.0) / denominator
+    summary["error_se"] = summary["error_sd"].fillna(0.0) / denominator
+    return summary.sort_values("x").reset_index(drop=True)
+
+
+def _validation_mpc_binscatter(
+    bundle: PolicySurrogateBundle,
+    *,
+    bundle_path: str | Path,
+) -> None:
+    st.subheader("MPC divergence by state and model parameter")
+    st.caption(
+        "This uses explicit baseline/treated pairs from entirely held-out model "
+        "parameterizations. True MPCs come from the saved policy grids; surrogate "
+        "MPCs are finite differences of the fitted consumption function on those "
+        "same rows."
+    )
+
+    enabled = st.checkbox(
+        "Load household-level held-out MPC diagnostics",
+        value=False,
+        key="validation_enable_mpc_binscatter",
+        help=(
+            "The first load reads policy_grid_sample and evaluates the surrogate "
+            "on all paired rows in the holdout set. The result is cached."
+        ),
+    )
+    if not enabled:
+        return
+
+    sample_path = _training_sample_path(bundle_path)
+    if sample_path is None:
+        st.error(
+            "No policy_grid_sample file was found beside the surrogate bundle. "
+            "This household-level validation plot requires that sampled file."
+        )
+        return
+
+    resolved_bundle = Path(bundle_path).expanduser().resolve()
+    try:
+        with st.spinner("Constructing held-out true and surrogate MPC pairs..."):
+            comparison = _load_holdout_mpc_validation(
+                str(resolved_bundle),
+                int(resolved_bundle.stat().st_mtime_ns),
+                str(sample_path.resolve()),
+                int(sample_path.stat().st_mtime_ns),
+            )
+    except Exception as exc:
+        st.error(f"Could not construct held-out MPC diagnostics: {exc}")
+        return
+
+    x_columns = _mpc_validation_columns(bundle, comparison)
+    if not x_columns:
+        st.error("No varying numeric states or parameters are available for plotting.")
+        return
+
+    default_x = "age" if "age" in x_columns else x_columns[0]
+    c1, c2, c3, c4 = st.columns([1.6, 1.0, 1.0, 1.1])
+    with c1:
+        x = st.selectbox(
+            "Horizontal axis",
+            x_columns,
+            index=x_columns.index(default_x),
+            format_func=_pretty,
+            key="validation_mpc_x",
+        )
+    with c2:
+        n_bins = st.slider(
+            "Number of bins",
+            min_value=5,
+            max_value=40,
+            value=20,
+            step=1,
+            key="validation_mpc_bins",
+        )
+    with c3:
+        trim_label = st.selectbox(
+            "Trim x-axis tails",
+            ["None", "0.1%", "0.5%", "1%"],
+            index=2,
+            key="validation_mpc_trim",
+        )
+        trim_share = {
+            "None": 0.0,
+            "0.1%": 0.001,
+            "0.5%": 0.005,
+            "1%": 0.01,
+        }[trim_label]
+    with c4:
+        equal_weight_models = st.checkbox(
+            "Equal weight per model",
+            value=True,
+            key="validation_mpc_equal_model_weight",
+            help=(
+                "Within each bin, first average within each held-out model and "
+                "then average across models."
+            ),
+        )
+
+    filtered = comparison.copy()
+    filter_columns = st.columns(2)
+    if "is_retired" in filtered:
+        with filter_columns[0]:
+            retirement_filter = st.selectbox(
+                "Lifecycle group",
+                ["All", "Working age", "Retired"],
+                key="validation_mpc_retirement_filter",
+            )
+        retired = pd.to_numeric(filtered["is_retired"], errors="coerce").fillna(0)
+        if retirement_filter == "Working age":
+            filtered = filtered.loc[retired.eq(0)].copy()
+        elif retirement_filter == "Retired":
+            filtered = filtered.loc[retired.eq(1)].copy()
+
+    check_values = (
+        pd.to_numeric(filtered["mpc_check_units"], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    if len(check_values) and check_values.max() > check_values.min():
+        with filter_columns[1]:
+            check_min = float(check_values.min())
+            check_max = float(check_values.max())
+            check_range = st.slider(
+                "Actual check size in bundle units",
+                min_value=check_min,
+                max_value=check_max,
+                value=(check_min, check_max),
+                step=max((check_max - check_min) / 250.0, 1.0e-8),
+                key="validation_mpc_check_range",
+            )
+        filtered = filtered[
+            pd.to_numeric(filtered["mpc_check_units"], errors="coerce").between(
+                float(check_range[0]), float(check_range[1])
+            )
+        ].copy()
+
+    if filtered.empty:
+        st.warning("No MPC pairs remain after applying the filters.")
+        return
+
+    bins = _mpc_binscatter_table(
+        filtered,
+        x=x,
+        n_bins=int(n_bins),
+        trim_share=float(trim_share),
+        equal_weight_models=bool(equal_weight_models),
+    )
+    if bins.empty:
+        st.warning("The selected variable does not have enough finite observations.")
+        return
+
+    true = pd.to_numeric(filtered["true_mpc"], errors="coerce").to_numpy(dtype=float)
+    surrogate = pd.to_numeric(filtered["surrogate_mpc"], errors="coerce").to_numpy(
+        dtype=float
+    )
+    finite = np.isfinite(true) & np.isfinite(surrogate)
+    true, surrogate = true[finite], surrogate[finite]
+    error = surrogate - true
+    sst = float(np.sum((true - np.mean(true)) ** 2))
+    r2 = float(1.0 - np.sum(error**2) / sst) if sst > 0 else np.nan
+    rmse = float(np.sqrt(np.mean(error**2)))
+    bias = float(np.mean(error))
+    correlation = (
+        float(np.corrcoef(true, surrogate)[0, 1])
+        if len(true) > 1 and np.std(true) > 0 and np.std(surrogate) > 0
+        else np.nan
+    )
+    worst_index = bins["mean_error"].abs().idxmax()
+    worst = bins.loc[worst_index]
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("MPC pairs", f"{len(true):,}")
+    m2.metric("Held-out models", f"{filtered['model_id'].nunique():,}")
+    m3.metric("MPC R²", f"{r2:.3f}" if np.isfinite(r2) else "NA")
+    m4.metric(
+        "MPC correlation", f"{correlation:.3f}" if np.isfinite(correlation) else "NA"
+    )
+    m5.metric("MPC RMSE", f"{rmse:.4f}")
+    m6.metric("MPC bias", f"{bias:+.4f}")
+
+    custom = np.column_stack(
+        [
+            bins["x_min"],
+            bins["x_max"],
+            bins["pairs"],
+            bins["models"],
+            bins["mean_error"],
+            bins["rmse"],
+        ]
+    )
+    show_ci = st.checkbox(
+        "Show 95% uncertainty intervals",
+        value=False,
+        key="validation_mpc_show_ci",
+        help=(
+            "With equal model weights, intervals use variation in model-level "
+            "bin means. Otherwise they use variation across MPC pairs."
+        ),
+    )
+    true_error_y = (
+        dict(type="data", array=1.96 * bins["true_se"], visible=True)
+        if show_ci
+        else None
+    )
+    surrogate_error_y = (
+        dict(type="data", array=1.96 * bins["surrogate_se"], visible=True)
+        if show_ci
+        else None
+    )
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["true_mpc"],
+            mode="lines+markers",
+            name="True MPC",
+            error_y=true_error_y,
+            customdata=custom,
+            hovertemplate=(
+                f"{_pretty(x)} mean: %{{x:.5g}}<br>"
+                "Bin range: %{customdata[0]:.5g} to %{customdata[1]:.5g}<br>"
+                "True MPC: %{y:.4f}<br>"
+                "Pairs: %{customdata[2]:,.0f}<br>"
+                "Models: %{customdata[3]:,.0f}<extra></extra>"
+            ),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["surrogate_mpc"],
+            mode="lines+markers",
+            name="Surrogate MPC",
+            error_y=surrogate_error_y,
+            customdata=custom,
+            hovertemplate=(
+                f"{_pretty(x)} mean: %{{x:.5g}}<br>"
+                "Bin range: %{customdata[0]:.5g} to %{customdata[1]:.5g}<br>"
+                "Surrogate MPC: %{y:.4f}<br>"
+                "Bias: %{customdata[4]:+.4f}<br>"
+                "Bin RMSE: %{customdata[5]:.4f}<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=560,
+        title="Binned mean true and surrogate MPC",
+        xaxis_title=_pretty(x),
+        yaxis_title="Marginal propensity to consume",
+        hovermode="x unified",
+        legend_title="Policy source",
+        margin=dict(l=45, r=20, t=65, b=45),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig_error = go.Figure()
+    fig_error.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["mean_error"],
+            mode="lines+markers",
+            name="Mean error",
+            error_y=(
+                dict(type="data", array=1.96 * bins["error_se"], visible=True)
+                if show_ci
+                else None
+            ),
+            customdata=custom,
+            hovertemplate=(
+                f"{_pretty(x)} mean: %{{x:.5g}}<br>"
+                "Mean surrogate − true: %{y:+.4f}<br>"
+                "Bin RMSE: %{customdata[5]:.4f}<br>"
+                "Pairs: %{customdata[2]:,.0f}<br>"
+                "Models: %{customdata[3]:,.0f}<extra></extra>"
+            ),
+        )
+    )
+    fig_error.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["rmse"],
+            mode="lines+markers",
+            name="RMSE",
+            customdata=custom,
+            hovertemplate=(
+                f"{_pretty(x)} mean: %{{x:.5g}}<br>" "RMSE: %{y:.4f}<extra></extra>"
+            ),
+        )
+    )
+    fig_error.add_hline(y=0.0, line_dash="dash")
+    fig_error.update_layout(
+        template="plotly_white",
+        height=460,
+        title="Binned MPC error",
+        xaxis_title=_pretty(x),
+        yaxis_title="MPC error",
+        hovermode="x unified",
+        legend_title="Diagnostic",
+        margin=dict(l=45, r=20, t=65, b=45),
+    )
+    st.plotly_chart(fig_error, use_container_width=True)
+
+    st.caption(
+        f"Largest absolute binned bias: {worst['mean_error']:+.4f} around "
+        f"{_pretty(x)} = {worst['x']:.5g} "
+        f"(bin RMSE {worst['rmse']:.4f}, {int(worst['models']):,} models)."
+    )
+
+    display = bins.rename(
+        columns={
+            "x": _pretty(x),
+            "x_min": "Bin minimum",
+            "x_max": "Bin maximum",
+            "true_mpc": "True MPC",
+            "surrogate_mpc": "Surrogate MPC",
+            "mean_error": "Mean error",
+            "mean_absolute_error": "Mean absolute error",
+            "rmse": "RMSE",
+            "pairs": "Pairs",
+            "models": "Models",
+        }
+    )[
+        [
+            _pretty(x),
+            "Bin minimum",
+            "Bin maximum",
+            "True MPC",
+            "Surrogate MPC",
+            "Mean error",
+            "Mean absolute error",
+            "RMSE",
+            "Pairs",
+            "Models",
+        ]
+    ]
+    with st.expander("Binned MPC comparison data", expanded=False):
+        st.dataframe(display, hide_index=True, use_container_width=True)
+        st.download_button(
+            "Download binned MPC comparison as CSV",
+            data=display.to_csv(index=False).encode("utf-8"),
+            file_name=f"holdout_mpc_binscatter_{x}.csv",
+            mime="text/csv",
+            key="download_holdout_mpc_binscatter",
+        )
+
+
+def _validation_page(
+    bundle: PolicySurrogateBundle,
+    *,
+    bundle_path: str | Path,
+) -> None:
     st.subheader("Validation on entirely held-out parameterizations")
     st.caption(
         "Consumption and deposit are fitted directly. Both asset levels and both "
@@ -2081,6 +2766,11 @@ def _validation_page(bundle: PolicySurrogateBundle) -> None:
         st.plotly_chart(fig2, use_container_width=True)
         st.dataframe(d, hide_index=True, use_container_width=True)
 
+    _validation_mpc_binscatter(
+        bundle,
+        bundle_path=bundle_path,
+    )
+
 
 def main() -> None:
     st.set_page_config(page_title="HA Policy Surrogate", layout="wide")
@@ -2096,31 +2786,8 @@ def main() -> None:
     try:
         bundle = _load_bundle(str(Path(bundle_path).expanduser()))
     except Exception as exc:
-        import platform
-        import traceback
-
-        import joblib
-        import numpy
-        import scipy
-        import sklearn
-
-        st.exception(exc)
-
-        st.code(traceback.format_exc())
-
-        st.write(
-            {
-                "python": platform.python_version(),
-                "numpy": numpy.__version__,
-                "scipy": scipy.__version__,
-                "scikit_learn": sklearn.__version__,
-                "joblib": joblib.__version__,
-                "surrogate_module": __import__("ha_policy_surrogate").__file__,
-            }
-        )
-
+        st.error(f"Could not load surrogate bundle: {exc}")
         st.stop()
-
     continuous_columns = _continuous_plot_columns(bundle)
 
     if not continuous_columns:
@@ -2215,7 +2882,10 @@ def main() -> None:
         )
 
     with tabs[5]:
-        _validation_page(bundle)
+        _validation_page(
+            bundle,
+            bundle_path=bundle_path,
+        )
 
 
 if __name__ == "__main__":

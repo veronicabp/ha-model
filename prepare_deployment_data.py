@@ -43,7 +43,7 @@ held_out_mask = split.str.contains("held", na=False) | split.str.contains(
     "test", na=False
 )
 
-held_out_ids = list(set(metrics.loc[held_out_mask, "model_id"]))[:100]
+held_out_ids = list(set(metrics.loc[held_out_mask, "model_id"]))[:500]
 
 if not held_out_ids:
     raise RuntimeError("No held-out model IDs were found in validation_by_model.")

@@ -470,9 +470,7 @@ def _inspect_policy_storage(
         keys = set(z.files)
         consumption_key = _find_array_key(z, "consumption", schema, required=False)
         deposit_key = _find_array_key(z, "deposit", schema, required=False)
-        liquid_drift_key = _find_array_key(
-            z, "liquid_drift", schema, required=False
-        )
+        liquid_drift_key = _find_array_key(z, "liquid_drift", schema, required=False)
         illiquid_drift_key = _find_array_key(
             z, "illiquid_drift", schema, required=False
         )
@@ -544,8 +542,7 @@ def _validate_policy_storage_for_training(
 
     if (
         schema.require_compact_policies
-        and storage.get("policy_storage_format")
-        != "compact_consumption_deposit"
+        and storage.get("policy_storage_format") != "compact_consumption_deposit"
     ):
         return (
             False,
@@ -833,7 +830,6 @@ def _stratified_coordinates(
     return out
 
 
-
 def _mpc_aware_coordinates(
     canonical_shape: tuple[int, int, int, int, int, int],
     n: int,
@@ -915,7 +911,9 @@ def _mpc_aware_coordinates(
         # Stratification gives approximately equal coverage over feasible
         # baseline positions.  A few deterministic lower-bound anchors retain
         # precision exactly where the borrowing constraint begins to bind.
-        baseline_quantiles = (np.arange(n_pairs, dtype=float) + rng.random(n_pairs)) / n_pairs
+        baseline_quantiles = (
+            np.arange(n_pairs, dtype=float) + rng.random(n_pairs)
+        ) / n_pairs
         rng.shuffle(baseline_quantiles)
 
         for i, desired_check in enumerate(draw_checks):
@@ -973,6 +971,7 @@ def _mpc_aware_coordinates(
         raise RuntimeError("MPC-aware sampler returned the wrong number of rows.")
 
     return coords, pair_id, pair_role, pair_check
+
 
 def _resolve_ages(
     arrays: Mapping[str, np.ndarray],
@@ -1667,7 +1666,10 @@ def build_policy_dataset(
         storage_text = ", ".join(
             f"{name}={int(count):,}" for name, count in storage_counts_all.items()
         )
-        _status(f"  policy storage across all discovered models: {storage_text}", verbose=verbose)
+        _status(
+            f"  policy storage across all discovered models: {storage_text}",
+            verbose=verbose,
+        )
 
     rejected = catalog[~catalog["usable"]].copy()
     if not rejected.empty:
@@ -1900,9 +1902,7 @@ DEFAULT_SPLINE_COLUMNS = (
 # A tensor-product spline lets the liquid-wealth slope vary smoothly with the
 # remaining lifecycle horizon.  This replaces the earlier global retiree slope
 # shift that generated an artificial second MPC peak.
-DEFAULT_SPLINE_TENSOR_PAIRS = (
-    ("liquid_slack_to_income", "years_to_terminal"),
-)
+DEFAULT_SPLINE_TENSOR_PAIRS = (("liquid_slack_to_income", "years_to_terminal"),)
 
 # Keep is_retired as a level indicator, but do not allow it to create an
 # unrestricted discrete jump in every state slope or every liquid spline.
@@ -2275,7 +2275,11 @@ class StructuredPolynomialMap:
                 for j in range(i + 1, len(state_names))
             ]
         if self.state_parameter_interactions:
-            names += [f"{state}*{parameter}" for state in state_names for parameter in parameter_names]
+            names += [
+                f"{state}*{parameter}"
+                for state in state_names
+                for parameter in parameter_names
+            ]
         if self.parameter_parameter_interactions:
             names += [
                 f"{parameter_names[i]}*{parameter_names[j]}"
@@ -2343,9 +2347,7 @@ class StructuredPolynomialMap:
                 for j in range(i + 1, state.shape[1])
             )
         if self.state_parameter_interactions and params.shape[1] > 0:
-            blocks.append(
-                (state[:, :, None] * params[:, None, :]).reshape(len(X), -1)
-            )
+            blocks.append((state[:, :, None] * params[:, None, :]).reshape(len(X), -1))
         if self.parameter_parameter_interactions and params.shape[1] > 1:
             blocks.extend(
                 params[:, i : i + 1] * params[:, j : j + 1]
@@ -2381,9 +2383,7 @@ class StructuredPolynomialMap:
             ):
                 selected_cats = cats[:, self.spline_categorical_indices_]
                 blocks.append(
-                    (spline[:, :, None] * selected_cats[:, None, :]).reshape(
-                        len(X), -1
-                    )
+                    (spline[:, :, None] * selected_cats[:, None, :]).reshape(len(X), -1)
                 )
             for left, right in self.active_spline_tensor_pairs_:
                 left_block = spline[:, self.spline_slices_[left]]
@@ -2482,9 +2482,7 @@ class SmoothRFFMap:
             0.0, 2.0 * math.pi, size=self.n_components
         ).astype(np.float32)
         self.gamma_ = gamma
-        self.feature_names_ = [
-            f"rbf_{i}" for i in range(self.n_components)
-        ]
+        self.feature_names_ = [f"rbf_{i}" for i in range(self.n_components)]
         if self.include_linear:
             self.feature_names_ += [f"linear_{i}" for i in range(d)]
         return self
@@ -2497,9 +2495,7 @@ class SmoothRFFMap:
             Z @ self.random_weights_ + self.random_offset_
         )
         if self.include_linear:
-            return np.concatenate([rff, Z], axis=1).astype(
-                np.float32, copy=False
-            )
+            return np.concatenate([rff, Z], axis=1).astype(np.float32, copy=False)
         return rff.astype(np.float32, copy=False)
 
     def fit_transform(self, X: pd.DataFrame) -> np.ndarray:
@@ -2943,10 +2939,7 @@ def _transfer_use_from_deposit(
     return (
         d
         + np.asarray(chi0, dtype=float) * np.abs(d)
-        + 0.5
-        * np.asarray(chi1, dtype=float)
-        * d**2
-        / np.maximum(a, floor)
+        + 0.5 * np.asarray(chi1, dtype=float) * d**2 / np.maximum(a, floor)
     )
 
 
@@ -3030,9 +3023,9 @@ def reconstruct_policy_outputs(
     b = pd.to_numeric(X["liquid_assets"], errors="coerce").to_numpy(dtype=float)
     a = pd.to_numeric(X["illiquid_assets"], errors="coerce").to_numpy(dtype=float)
     y = pd.to_numeric(X["after_tax_income"], errors="coerce").to_numpy(dtype=float)
-    c = pd.to_numeric(
-        primitive_predictions["consumption"], errors="coerce"
-    ).to_numpy(dtype=float)
+    c = pd.to_numeric(primitive_predictions["consumption"], errors="coerce").to_numpy(
+        dtype=float
+    )
     d_direct = pd.to_numeric(
         primitive_predictions["deposit"], errors="coerce"
     ).to_numpy(dtype=float)
@@ -3234,9 +3227,7 @@ def reconstruct_policy_outputs(
     out["next_illiquid_assets"] = next_a
     out["delta_liquid_assets"] = next_b - b
     out["delta_illiquid_assets"] = next_a - a
-    out["liquid_asset_projection_binding"] = (
-        np.abs(next_b - next_b_unclipped) > 1.0e-10
-    )
+    out["liquid_asset_projection_binding"] = np.abs(next_b - next_b_unclipped) > 1.0e-10
     out["illiquid_asset_projection_binding"] = (
         np.abs(next_a - next_a_unclipped) > 1.0e-10
     )
@@ -3420,21 +3411,28 @@ def _primitive_predictions_from_models(
     return pd.DataFrame(out, index=X.index)
 
 
-
 def _paired_mpc_table(
     data: pd.DataFrame,
     predicted_consumption: np.ndarray | pd.Series | None = None,
 ) -> pd.DataFrame:
     """Return exact/predicted MPCs and baseline lifecycle states for each pair."""
 
-    required = {"model_id", "mpc_pair_id", "mpc_pair_role", "mpc_check_units", "consumption"}
+    required = {
+        "model_id",
+        "mpc_pair_id",
+        "mpc_pair_role",
+        "mpc_check_units",
+        "consumption",
+    }
     if not required.issubset(data.columns):
         return pd.DataFrame()
 
     frame = data.reset_index(drop=True)
     pair_id = pd.to_numeric(frame["mpc_pair_id"], errors="coerce").to_numpy(dtype=float)
     role = pd.to_numeric(frame["mpc_pair_role"], errors="coerce").to_numpy(dtype=float)
-    check = pd.to_numeric(frame["mpc_check_units"], errors="coerce").to_numpy(dtype=float)
+    check = pd.to_numeric(frame["mpc_check_units"], errors="coerce").to_numpy(
+        dtype=float
+    )
     exact = pd.to_numeric(frame["consumption"], errors="coerce").to_numpy(dtype=float)
 
     valid = (
@@ -3474,7 +3472,9 @@ def _paired_mpc_table(
         "liquid_slack_to_income",
     ):
         if column in frame:
-            temp_data[column] = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+            temp_data[column] = pd.to_numeric(frame[column], errors="coerce").to_numpy(
+                dtype=float
+            )
 
     temp = pd.DataFrame(temp_data).loc[valid]
     keys = ["model_id", "pair_id"]
@@ -3487,8 +3487,7 @@ def _paired_mpc_table(
     baseline = baseline.loc[common]
     treated = treated.loc[common]
     pair_check = 0.5 * (
-        baseline["check"].to_numpy(dtype=float)
-        + treated["check"].to_numpy(dtype=float)
+        baseline["check"].to_numpy(dtype=float) + treated["check"].to_numpy(dtype=float)
     )
     good = np.isfinite(pair_check) & (pair_check > EPS)
 
@@ -3501,11 +3500,13 @@ def _paired_mpc_table(
         "exact_mpc": (
             treated["exact_consumption"].to_numpy(dtype=float)
             - baseline["exact_consumption"].to_numpy(dtype=float)
-        ) / pair_check,
+        )
+        / pair_check,
         "predicted_mpc": (
             treated["predicted_consumption"].to_numpy(dtype=float)
             - baseline["predicted_consumption"].to_numpy(dtype=float)
-        ) / pair_check,
+        )
+        / pair_check,
     }
     for column in (
         "age",
@@ -3614,24 +3615,36 @@ def _stratified_pair_subsample(
         work["age"] if "age" in work else pd.Series(np.nan, index=work.index),
         errors="coerce",
     )
-    work["__age_bin"] = pd.cut(
-        age_values,
-        bins=age_edges,
-        labels=False,
-        include_lowest=True,
-    ).fillna(-1).astype(int)
-    retired = pd.to_numeric(
-        work["is_retired"]
-        if "is_retired" in work
-        else pd.Series(np.nan, index=work.index),
-        errors="coerce",
-    ).fillna(-1).astype(int)
+    work["__age_bin"] = (
+        pd.cut(
+            age_values,
+            bins=age_edges,
+            labels=False,
+            include_lowest=True,
+        )
+        .fillna(-1)
+        .astype(int)
+    )
+    retired = (
+        pd.to_numeric(
+            (
+                work["is_retired"]
+                if "is_retired" in work
+                else pd.Series(np.nan, index=work.index)
+            ),
+            errors="coerce",
+        )
+        .fillna(-1)
+        .astype(int)
+    )
     work["__retired"] = retired
 
     liquid = pd.to_numeric(
-        work["liquid_slack_to_income"]
-        if "liquid_slack_to_income" in work
-        else pd.Series(np.nan, index=work.index),
+        (
+            work["liquid_slack_to_income"]
+            if "liquid_slack_to_income" in work
+            else pd.Series(np.nan, index=work.index)
+        ),
         errors="coerce",
     )
     finite_liquid = liquid[np.isfinite(liquid)]
@@ -3642,13 +3655,17 @@ def _stratified_pair_subsample(
         if len(quantiles) >= 3:
             quantiles[0] = -np.inf
             quantiles[-1] = np.inf
-            work["__liquid_bin"] = pd.cut(
-                liquid,
-                bins=quantiles,
-                labels=False,
-                include_lowest=True,
-                duplicates="drop",
-            ).fillna(-1).astype(int)
+            work["__liquid_bin"] = (
+                pd.cut(
+                    liquid,
+                    bins=quantiles,
+                    labels=False,
+                    include_lowest=True,
+                    duplicates="drop",
+                )
+                .fillna(-1)
+                .astype(int)
+            )
         else:
             work["__liquid_bin"] = 0
     else:
@@ -3659,7 +3676,9 @@ def _stratified_pair_subsample(
     )
 
     if max_pairs is None or max_pairs <= 0 or len(work) <= int(max_pairs):
-        return work.drop(columns=[c for c in work if c.startswith("__")]).reset_index(drop=True)
+        return work.drop(columns=[c for c in work if c.startswith("__")]).reset_index(
+            drop=True
+        )
 
     limit = int(max_pairs)
     rng = np.random.default_rng(int(random_state))
@@ -3737,10 +3756,10 @@ def _build_mpc_pair_design(
         liquid_bins=liquid_bins,
     )
 
-    baseline = pairs['baseline_position'].to_numpy(dtype=np.int64)
-    treated = pairs['treated_position'].to_numpy(dtype=np.int64)
-    checks = pairs['check_units'].to_numpy(dtype=float)
-    targets = pairs['exact_mpc'].to_numpy(dtype=float)
+    baseline = pairs["baseline_position"].to_numpy(dtype=np.int64)
+    treated = pairs["treated_position"].to_numpy(dtype=np.int64)
+    checks = pairs["check_units"].to_numpy(dtype=float)
+    targets = pairs["exact_mpc"].to_numpy(dtype=float)
 
     valid = (
         (baseline >= 0)
@@ -3755,11 +3774,11 @@ def _build_mpc_pair_design(
     treated = treated[valid]
     checks = checks[valid]
     targets = targets[valid]
-    model_ids = pairs.loc[valid, 'model_id'].astype(str).to_numpy(dtype=object)
+    model_ids = pairs.loc[valid, "model_id"].astype(str).to_numpy(dtype=object)
 
     q = float(trim_quantile)
     if q < 0.0 or q >= 0.5:
-        raise ValueError('mpc_objective_trim_quantile must be in [0, 0.5).')
+        raise ValueError("mpc_objective_trim_quantile must be in [0, 0.5).")
     if q > 0.0 and len(targets) >= 100:
         lo, hi = np.quantile(targets, [q, 1.0 - q])
         keep = (targets >= lo) & (targets <= hi)
@@ -3818,22 +3837,22 @@ class JointConsumptionMPCRegressor:
         Z: np.ndarray,
         y: np.ndarray,
         pair_design: MPCPairDesign,
-    ) -> 'JointConsumptionMPCRegressor':
+    ) -> "JointConsumptionMPCRegressor":
         Z_arr = np.asarray(Z, dtype=np.float32)
         y_arr = np.asarray(y, dtype=np.float64)
         if Z_arr.ndim != 2 or len(y_arr) != len(Z_arr):
-            raise ValueError('Z and y have incompatible dimensions.')
+            raise ValueError("Z and y have incompatible dimensions.")
         if pair_design is None or pair_design.n_pairs == 0:
-            raise ValueError('Joint MPC fitting requires at least one valid pair.')
+            raise ValueError("Joint MPC fitting requires at least one valid pair.")
         if self.alpha < 0.0 or self.mpc_weight <= 0.0:
-            raise ValueError('alpha must be nonnegative and mpc_weight positive.')
+            raise ValueError("alpha must be nonnegative and mpc_weight positive.")
         if self.max_iter <= 0 or self.tol <= 0.0:
-            raise ValueError('max_iter and tol must be positive.')
+            raise ValueError("max_iter and tol must be positive.")
 
         D = np.asarray(pair_design.difference, dtype=np.float32)
         m = np.asarray(pair_design.target, dtype=np.float64)
         if D.ndim != 2 or D.shape[1] != Z_arr.shape[1] or len(D) != len(m):
-            raise ValueError('MPC pair design has incompatible dimensions.')
+            raise ValueError("MPC pair design has incompatible dimensions.")
 
         n_level, n_features = Z_arr.shape
         n_pairs = len(m)
@@ -3880,24 +3899,24 @@ class JointConsumptionMPCRegressor:
         self.coef_ = coef
         self.intercept_ = float(y_mean - z_mean @ coef)
         self.solver_diagnostics_ = {
-            'istop': int(solution[1]),
-            'iterations': int(solution[2]),
-            'residual_norm': float(solution[3]),
-            'normal_residual_norm': float(solution[4]),
-            'operator_norm': float(solution[5]),
-            'condition_number': float(solution[6]),
-            'coefficient_norm': float(solution[7]),
-            'n_level_rows': int(n_level),
-            'n_mpc_pairs': int(n_pairs),
-            'mpc_pairs_available': int(pair_design.n_available),
-            'mpc_weight': float(self.mpc_weight),
-            'alpha': float(self.alpha),
+            "istop": int(solution[1]),
+            "iterations": int(solution[2]),
+            "residual_norm": float(solution[3]),
+            "normal_residual_norm": float(solution[4]),
+            "operator_norm": float(solution[5]),
+            "condition_number": float(solution[6]),
+            "coefficient_norm": float(solution[7]),
+            "n_level_rows": int(n_level),
+            "n_mpc_pairs": int(n_pairs),
+            "mpc_pairs_available": int(pair_design.n_available),
+            "mpc_weight": float(self.mpc_weight),
+            "alpha": float(self.alpha),
         }
         return self
 
     def predict(self, Z: np.ndarray) -> np.ndarray:
         if self.coef_ is None or self.intercept_ is None:
-            raise RuntimeError('The joint consumption/MPC regressor is not fitted.')
+            raise RuntimeError("The joint consumption/MPC regressor is not fitted.")
         return float(self.intercept_) + np.asarray(Z, dtype=np.float64) @ self.coef_
 
     def predict_mpc(
@@ -3907,10 +3926,10 @@ class JointConsumptionMPCRegressor:
         check_sizes: np.ndarray,
     ) -> np.ndarray:
         if self.coef_ is None:
-            raise RuntimeError('The joint consumption/MPC regressor is not fitted.')
+            raise RuntimeError("The joint consumption/MPC regressor is not fitted.")
         checks = np.asarray(check_sizes, dtype=np.float64)
         if np.any(~np.isfinite(checks)) or np.any(checks <= 0.0):
-            raise ValueError('check_sizes must be finite and positive.')
+            raise ValueError("check_sizes must be finite and positive.")
         difference = (
             np.asarray(Z_treated, dtype=np.float64)
             - np.asarray(Z_baseline, dtype=np.float64)
@@ -3931,7 +3950,7 @@ def _fit_consumption_regressor(
     """Fit ordinary ridge or the joint level/MPC estimator."""
 
     if float(mpc_weight) <= 0.0 or pair_design is None or pair_design.n_pairs == 0:
-        model = Ridge(alpha=float(alpha), fit_intercept=True, solver='lsqr')
+        model = Ridge(alpha=float(alpha), fit_intercept=True, solver="lsqr")
         model.fit(Z, y)
         return model
 
@@ -4214,8 +4233,12 @@ def fit_policy_surrogate(
     spline_columns: Sequence[str] = DEFAULT_SPLINE_COLUMNS,
     spline_n_knots: int = 6,
     spline_tensor_pairs: Sequence[tuple[str, str]] = DEFAULT_SPLINE_TENSOR_PAIRS,
-    categorical_slope_exclude_patterns: Sequence[str] = DEFAULT_CATEGORICAL_SLOPE_EXCLUDE_PATTERNS,
-    spline_categorical_exclude_patterns: Sequence[str] = DEFAULT_SPLINE_CATEGORICAL_EXCLUDE_PATTERNS,
+    categorical_slope_exclude_patterns: Sequence[
+        str
+    ] = DEFAULT_CATEGORICAL_SLOPE_EXCLUDE_PATTERNS,
+    spline_categorical_exclude_patterns: Sequence[
+        str
+    ] = DEFAULT_SPLINE_CATEGORICAL_EXCLUDE_PATTERNS,
     rff_components: int = 512,
     ridge_alphas: Sequence[float] = (
         1.0e-4,
@@ -4292,7 +4315,9 @@ def fit_policy_surrogate(
     )
     if not candidate_mpc_weights or any(x < 0.0 for x in candidate_mpc_weights):
         raise ValueError("MPC difference weights must be a nonempty nonnegative grid.")
-    if consumption_transform != "identity" and any(x > 0.0 for x in candidate_mpc_weights):
+    if consumption_transform != "identity" and any(
+        x > 0.0 for x in candidate_mpc_weights
+    ):
         raise ValueError(
             "Direct MPC targeting requires --consumption-transform identity."
         )
@@ -4564,9 +4589,9 @@ def fit_policy_surrogate(
         y_train_transformed[target] = transform.transform(
             pd.to_numeric(train[target], errors="coerce").to_numpy(dtype=float)
         )
-        y_tune_levels[target] = pd.to_numeric(
-            tune[target], errors="coerce"
-        ).to_numpy(dtype=float)
+        y_tune_levels[target] = pd.to_numeric(tune[target], errors="coerce").to_numpy(
+            dtype=float
+        )
 
     _status(
         f"[fit 3/6] Tuning ridge penalties and the direct MPC objective...",
@@ -4581,7 +4606,7 @@ def fit_policy_surrogate(
 
     tasks: list[tuple[str, float, float]] = []
     for target in ALL_FIT_TARGETS:
-        weights = candidate_mpc_weights if target == 'consumption' else [0.0]
+        weights = candidate_mpc_weights if target == "consumption" else [0.0]
         for alpha in ridge_alphas:
             for direct_weight in weights:
                 tasks.append((target, float(alpha), float(direct_weight)))
@@ -4589,13 +4614,13 @@ def fit_policy_surrogate(
     iterator = _progress_iter(
         tasks,
         total=len(tasks),
-        description='Ridge/MPC tuning',
-        unit='fit',
+        description="Ridge/MPC tuning",
+        unit="fit",
         enabled=show_progress,
     )
 
     for position, (target, alpha, direct_weight) in enumerate(iterator, start=1):
-        if target == 'consumption':
+        if target == "consumption":
             model = _fit_consumption_regressor(
                 Z_train,
                 y_train_transformed[target],
@@ -4606,7 +4631,7 @@ def fit_policy_surrogate(
                 tol=mpc_objective_tol,
             )
         else:
-            model = Ridge(alpha=alpha, fit_intercept=True, solver='lsqr')
+            model = Ridge(alpha=alpha, fit_intercept=True, solver="lsqr")
             model.fit(Z_train, y_train_transformed[target])
 
         pred_t = np.asarray(model.predict(Z_tune), dtype=float)
@@ -4620,11 +4645,11 @@ def fit_policy_surrogate(
         mpc_r2 = np.nan
         n_mpc_pairs = 0
 
-        if target == 'consumption':
+        if target == "consumption":
             pairs = _paired_mpc_table(tune, pred)
             if not pairs.empty:
-                exact_mpc = pairs['exact_mpc'].to_numpy(dtype=float)
-                predicted_mpc = pairs['predicted_mpc'].to_numpy(dtype=float)
+                exact_mpc = pairs["exact_mpc"].to_numpy(dtype=float)
+                predicted_mpc = pairs["predicted_mpc"].to_numpy(dtype=float)
                 ok = np.isfinite(exact_mpc) & np.isfinite(predicted_mpc)
                 if ok.any():
                     errors = predicted_mpc[ok] - exact_mpc[ok]
@@ -4644,21 +4669,21 @@ def fit_policy_surrogate(
                         + 0.10 * abs(mpc_bias) / max(mpc_sd, EPS)
                     )
 
-        solver_info = getattr(model, 'solver_diagnostics_', {}) or {}
+        solver_info = getattr(model, "solver_diagnostics_", {}) or {}
         alpha_rows.append(
             {
-                'target': target,
-                'alpha': alpha,
-                'mpc_difference_weight': direct_weight,
-                'tuning_nrmse_sd': level_nrmse,
-                'tuning_mpc_rmse': mpc_rmse,
-                'tuning_mpc_nrmse': mpc_nrmse,
-                'tuning_mpc_bias': mpc_bias,
-                'tuning_mpc_r2': mpc_r2,
-                'tuning_score': combined_score,
-                'n_mpc_tuning_pairs': n_mpc_pairs,
-                'joint_solver_iterations': solver_info.get('iterations'),
-                'joint_solver_stop_code': solver_info.get('istop'),
+                "target": target,
+                "alpha": alpha,
+                "mpc_difference_weight": direct_weight,
+                "tuning_nrmse_sd": level_nrmse,
+                "tuning_mpc_rmse": mpc_rmse,
+                "tuning_mpc_nrmse": mpc_nrmse,
+                "tuning_mpc_bias": mpc_bias,
+                "tuning_mpc_r2": mpc_r2,
+                "tuning_score": combined_score,
+                "n_mpc_tuning_pairs": n_mpc_pairs,
+                "joint_solver_iterations": solver_info.get("iterations"),
+                "joint_solver_stop_code": solver_info.get("istop"),
             }
         )
         if combined_score < best_scores[target]:
@@ -4675,16 +4700,16 @@ def fit_policy_surrogate(
         elif show_progress and _tqdm is not None:
             iterator.set_postfix(  # type: ignore[attr-defined]
                 target=target,
-                alpha=f'{alpha:g}',
-                mpc_w=f'{direct_weight:g}',
-                score=f'{combined_score:.4f}',
+                alpha=f"{alpha:g}",
+                mpc_w=f"{direct_weight:g}",
+                score=f"{combined_score:.4f}",
             )
 
     for target in ALL_FIT_TARGETS:
         suffix = (
             f", direct MPC weight={best_direct_mpc_weights[target]:g}"
-            if target == 'consumption'
-            else ''
+            if target == "consumption"
+            else ""
         )
         _status(
             f"  selected {target} alpha={best_alphas[target]:g}{suffix} "
@@ -4948,9 +4973,7 @@ def fit_policy_surrogate(
         "spline_columns": list(spline_columns),
         "spline_n_knots": int(spline_n_knots),
         "spline_tensor_pairs": [list(pair) for pair in spline_tensor_pairs],
-        "categorical_slope_exclude_patterns": list(
-            categorical_slope_exclude_patterns
-        ),
+        "categorical_slope_exclude_patterns": list(categorical_slope_exclude_patterns),
         "spline_categorical_exclude_patterns": list(
             spline_categorical_exclude_patterns
         ),
@@ -4963,12 +4986,8 @@ def fit_policy_surrogate(
             None if mpc_difference_weight is None else float(mpc_difference_weight)
         ),
         "mpc_difference_weight_grid": [float(x) for x in candidate_mpc_weights],
-        "mpc_difference_weight_selected": float(
-            best_direct_mpc_weights["consumption"]
-        ),
-        "mpc_difference_rows_used": bool(
-            best_direct_mpc_weights["consumption"] > 0.0
-        ),
+        "mpc_difference_weight_selected": float(best_direct_mpc_weights["consumption"]),
+        "mpc_difference_rows_used": bool(best_direct_mpc_weights["consumption"] > 0.0),
         "mpc_objective_max_pairs": (
             None if mpc_objective_max_pairs is None else int(mpc_objective_max_pairs)
         ),
@@ -5075,8 +5094,12 @@ def train_from_saved_grids(
     spline_columns: Sequence[str] = DEFAULT_SPLINE_COLUMNS,
     spline_n_knots: int = 6,
     spline_tensor_pairs: Sequence[tuple[str, str]] = DEFAULT_SPLINE_TENSOR_PAIRS,
-    categorical_slope_exclude_patterns: Sequence[str] = DEFAULT_CATEGORICAL_SLOPE_EXCLUDE_PATTERNS,
-    spline_categorical_exclude_patterns: Sequence[str] = DEFAULT_SPLINE_CATEGORICAL_EXCLUDE_PATTERNS,
+    categorical_slope_exclude_patterns: Sequence[
+        str
+    ] = DEFAULT_CATEGORICAL_SLOPE_EXCLUDE_PATTERNS,
+    spline_categorical_exclude_patterns: Sequence[
+        str
+    ] = DEFAULT_SPLINE_CATEGORICAL_EXCLUDE_PATTERNS,
     rff_components: int = 512,
     ridge_alphas: Sequence[float] = (
         1.0e-4,
