@@ -103,15 +103,19 @@ def _training_sample_path(bundle_path: str | Path) -> Path | None:
 
     parent = Path(bundle_path).expanduser().resolve().parent
     candidates = [
-        parent / "policy_grid_sample.pkl.gz",
+        # Deployment should contain only the reduced held-out MPC-pair sample.
+        parent / "heldout_mpc_pairs.parquet",
+        parent / "heldout_mpc_pairs.pkl.gz",
+        # Full-sample fallbacks are useful for local development only.
         parent / "policy_grid_sample.parquet",
+        parent / "policy_grid_sample.pkl.gz",
         parent / "policy_grid_sample.pkl",
         parent / "policy_grid_sample.csv",
     ]
     return next((path for path in candidates if path.exists()), None)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def _load_training_sample(bundle_path: str) -> pd.DataFrame:
     """Load the sampled grid data saved beside the surrogate bundle."""
 
@@ -824,7 +828,9 @@ def _one_dimensional_page(
         st.info("Select at least one overlay value.")
         return
 
-    sample = _load_training_sample(str(bundle_path))
+    # Do not load the household-level training sample for ordinary plots.
+    # Bundle-level output bounds provide stable axes without a large DataFrame.
+    sample = pd.DataFrame()
     y_range = _output_axis_control(
         bundle,
         sample,
@@ -933,7 +939,8 @@ def _surface_page(
     )
     table = surface.pivot(index="__y", columns="__x", values=f"pred_{output}")
 
-    sample = _load_training_sample(str(bundle_path))
+    # Avoid loading the full sampled grid merely to initialize the color scale.
+    sample = pd.DataFrame()
     z_range = _output_axis_control(
         bundle,
         sample,
@@ -1536,7 +1543,8 @@ def _exact_grid_comparison_page(
         )
 
     x_range = _range_selector(bundle, x, "exact_comparison_x_range")
-    sample = _load_training_sample(str(bundle_path))
+    # Exact-grid comparison uses bundle bounds for its initial y-axis range.
+    sample = pd.DataFrame()
     y_range = _output_axis_control(
         bundle,
         sample,
@@ -2843,49 +2851,60 @@ def main() -> None:
             "Grid versus polynomial",
             "MPCs: grid versus polynomial",
             "Validation",
-        ]
+        ],
+        key="main_tabs",
+        on_change="rerun",
     )
 
-    with tabs[0]:
-        _one_dimensional_page(
-            bundle,
-            base,
-            bundle_path=bundle_path,
-        )
+    # Streamlit otherwise evaluates every tab on every rerun.  Rendering only
+    # the open tab keeps exact grids, synthetic populations, and validation data
+    # out of memory until the user actually requests them.
+    if tabs[0].open:
+        with tabs[0]:
+            _one_dimensional_page(
+                bundle,
+                base,
+                bundle_path=bundle_path,
+            )
 
-    with tabs[1]:
-        _surface_page(
-            bundle,
-            base,
-            bundle_path=bundle_path,
-        )
+    if tabs[1].open:
+        with tabs[1]:
+            _surface_page(
+                bundle,
+                base,
+                bundle_path=bundle_path,
+            )
 
-    with tabs[2]:
-        _mpc_distribution_page(
-            bundle,
-            base,
-            bundle_path=bundle_path,
-        )
+    if tabs[2].open:
+        with tabs[2]:
+            _mpc_distribution_page(
+                bundle,
+                base,
+                bundle_path=bundle_path,
+            )
 
-    with tabs[3]:
-        _exact_grid_comparison_page(
-            bundle,
-            base,
-            bundle_path=bundle_path,
-        )
+    if tabs[3].open:
+        with tabs[3]:
+            _exact_grid_comparison_page(
+                bundle,
+                base,
+                bundle_path=bundle_path,
+            )
 
-    with tabs[4]:
-        _mpc_grid_comparison_page(
-            bundle,
-            base,
-            bundle_path=bundle_path,
-        )
+    if tabs[4].open:
+        with tabs[4]:
+            _mpc_grid_comparison_page(
+                bundle,
+                base,
+                bundle_path=bundle_path,
+            )
 
-    with tabs[5]:
-        _validation_page(
-            bundle,
-            bundle_path=bundle_path,
-        )
+    if tabs[5].open:
+        with tabs[5]:
+            _validation_page(
+                bundle,
+                bundle_path=bundle_path,
+            )
 
 
 if __name__ == "__main__":
