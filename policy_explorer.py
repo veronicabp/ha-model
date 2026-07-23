@@ -1358,8 +1358,30 @@ def _held_out_model_selector(
         catalog = _load_model_catalog(str(bundle_path))
         model_summary = _out_of_sample_model_summary(bundle, catalog)
     except Exception as exc:
-        st.error(str(exc))
-        return None
+        import platform
+        import traceback
+
+        import joblib
+        import numpy
+        import scipy
+        import sklearn
+
+        st.exception(exc)
+
+        st.code(traceback.format_exc())
+
+        st.write(
+            {
+                "python": platform.python_version(),
+                "numpy": numpy.__version__,
+                "scipy": scipy.__version__,
+                "scikit_learn": sklearn.__version__,
+                "joblib": joblib.__version__,
+                "surrogate_module": __import__("ha_policy_surrogate").__file__,
+            }
+        )
+
+        st.stop()
 
     display_summary = model_summary[
         ["model_id", "consumption_r2", "deposit_r2", "mean_r2"]
@@ -2058,8 +2080,31 @@ def main() -> None:
     try:
         bundle = _load_bundle(str(Path(bundle_path).expanduser()))
     except Exception as exc:
-        st.error(f"Could not load surrogate bundle: {exc}")
+        import platform
+        import traceback
+
+        import joblib
+        import numpy
+        import scipy
+        import sklearn
+
+        st.exception(exc)
+
+        st.code(traceback.format_exc())
+
+        st.write(
+            {
+                "python": platform.python_version(),
+                "numpy": numpy.__version__,
+                "scipy": scipy.__version__,
+                "scikit_learn": sklearn.__version__,
+                "joblib": joblib.__version__,
+                "surrogate_module": __import__("ha_policy_surrogate").__file__,
+            }
+        )
+
         st.stop()
+
     continuous_columns = _continuous_plot_columns(bundle)
 
     if not continuous_columns:
