@@ -6,6 +6,7 @@ from pathlib import Path
 
 import joblib
 import pandas as pd
+import numpy as np
 
 # ---------------------------------------------------------------------
 # Change these paths.
@@ -14,9 +15,7 @@ import pandas as pd
 SURROGATE_DIR = Path(
     "/Users/vbp/Dropbox (Personal)/research/research-data/iceland-data/ha_smooth"
 )
-DEPLOY_DIR = Path(
-    "/Users/vbp/Dropbox (Personal)/research/github-projects/ha-model"
-)
+DEPLOY_DIR = Path("/Users/vbp/Dropbox (Personal)/research/github-projects/ha-model")
 
 MAX_PUBLIC_MODELS = 500
 PINNED_MODEL_IDS: list[str] = []
@@ -40,8 +39,7 @@ catalog["model_id"] = catalog["model_id"].astype(str)
 
 split = metrics["split"].astype(str).str.lower()
 held_out = metrics[
-    split.str.contains("held", na=False)
-    | split.str.contains("test", na=False)
+    split.str.contains("held", na=False) | split.str.contains("test", na=False)
 ].copy()
 
 if held_out.empty:
@@ -61,9 +59,7 @@ ranked = ranked.sort_values(["mean_r2", "model_id"], ascending=[False, True])
 
 available_ids = set(catalog["model_id"])
 pinned = [
-    str(model_id)
-    for model_id in PINNED_MODEL_IDS
-    if str(model_id) in available_ids
+    str(model_id) for model_id in PINNED_MODEL_IDS if str(model_id) in available_ids
 ]
 remaining = [
     model_id
@@ -103,8 +99,8 @@ for row in public_catalog.itertuples(index=False):
             raise FileNotFoundError(f"Missing required model file: {source}")
         shutil.copy2(source, destination_dir / filename)
 
-public_catalog["model_dir"] = (
-    "held_out_models/" + public_catalog["model_id"].astype(str)
+public_catalog["model_dir"] = "held_out_models/" + public_catalog["model_id"].astype(
+    str
 )
 public_catalog.to_csv(APP_DATA_DIR / "model_catalog.csv", index=False)
 
@@ -139,11 +135,7 @@ sample["model_id"] = sample["model_id"].astype(str)
 pair_id = pd.to_numeric(sample["mpc_pair_id"], errors="coerce")
 pair_role = pd.to_numeric(sample["mpc_pair_role"], errors="coerce")
 
-keep = (
-    sample["model_id"].isin(public_ids)
-    & pair_id.ge(0)
-    & pair_role.isin([0, 1])
-)
+keep = sample["model_id"].isin(public_ids) & pair_id.ge(0) & pair_role.isin([0, 1])
 heldout_pairs = sample.loc[keep].copy()
 del sample
 
@@ -152,6 +144,43 @@ if heldout_pairs.empty:
 
 heldout_pairs.to_parquet(
     APP_DATA_DIR / "heldout_mpc_pairs.parquet",
+    index=False,
+)
+
+# Data for axes
+# Old website default axis ranges: 0.5th to 99.5th percentiles.
+policy_outputs = [
+    "consumption",
+    "deposit",
+    "delta_liquid_assets",
+    "delta_illiquid_assets",
+    "next_liquid_assets",
+    "next_illiquid_assets",
+]
+
+axis_rows = []
+
+for output in policy_outputs:
+    if output not in sample:
+        continue
+
+    values = pd.to_numeric(
+        sample[output],
+        errors="coerce",
+    )
+    values = values[np.isfinite(values)]
+
+    if len(values):
+        axis_rows.append(
+            {
+                "output": output,
+                "lower": float(values.quantile(0.005)),
+                "upper": float(values.quantile(0.995)),
+            }
+        )
+
+pd.DataFrame(axis_rows).to_csv(
+    APP_DATA_DIR / "output_axis_ranges.csv",
     index=False,
 )
 

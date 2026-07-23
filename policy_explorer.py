@@ -145,6 +145,33 @@ def _load_model_catalog(bundle_path: str) -> pd.DataFrame:
     return catalog.reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False)
+def _load_output_axis_ranges(
+    bundle_path: str,
+) -> dict[str, tuple[float, float]]:
+    path = Path(bundle_path).expanduser().resolve().parent / "output_axis_ranges.csv"
+
+    if not path.exists():
+        return {}
+
+    table = pd.read_csv(path)
+
+    required = {"output", "lower", "upper"}
+    if not required.issubset(table.columns):
+        return {}
+
+    ranges = {}
+
+    for row in table.itertuples(index=False):
+        lo = float(row.lower)
+        hi = float(row.upper)
+
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            ranges[str(row.output)] = (lo, hi)
+
+    return ranges
+
+
 def _out_of_sample_model_summary(
     bundle: PolicySurrogateBundle,
     catalog: pd.DataFrame,
@@ -243,8 +270,25 @@ def _default_output_range(
     bundle: PolicySurrogateBundle,
     sample: pd.DataFrame,
     output: str,
+    *,
+    stored_ranges: dict[str, tuple[float, float]] | None = None,
 ) -> tuple[float, float]:
     """Return a stable initial display range for one policy outcome."""
+
+    stored_ranges = stored_ranges or {}
+
+    if output in stored_ranges:
+        lo, hi = stored_ranges[output]
+
+    elif not sample.empty and output in sample:
+        values = pd.to_numeric(sample[output], errors="coerce")
+        values = values[np.isfinite(values)]
+
+        if len(values):
+            lo = float(values.quantile(0.005))
+            hi = float(values.quantile(0.995))
+        else:
+            lo, hi = -1.0, 1.0
 
     if not sample.empty and output in sample:
         values = pd.to_numeric(sample[output], errors="coerce")
@@ -291,10 +335,18 @@ def _output_axis_control(
     output: str,
     *,
     context: str,
+    bundle_path: str | Path,
 ) -> tuple[float, float]:
     """Persistent axis limits that do not change when other controls move."""
 
-    default_range = _default_output_range(bundle, sample, output)
+    stored_ranges = _load_output_axis_ranges(str(bundle_path))
+
+    default_range = _default_output_range(
+        bundle,
+        sample,
+        output,
+        stored_ranges=stored_ranges,
+    )
 
     range_key = f"{context}__fixed_output_range__{output}"
     min_widget_key = f"{context}__ymin__{output}"
@@ -832,10 +884,7 @@ def _one_dimensional_page(
     # Bundle-level output bounds provide stable axes without a large DataFrame.
     sample = pd.DataFrame()
     y_range = _output_axis_control(
-        bundle,
-        sample,
-        output,
-        context="one_dimensional",
+        bundle, sample, output, context="one_dimensional", bundle_path=bundle_path
     )
 
     fig = _line_slice(
@@ -942,10 +991,7 @@ def _surface_page(
     # Avoid loading the full sampled grid merely to initialize the color scale.
     sample = pd.DataFrame()
     z_range = _output_axis_control(
-        bundle,
-        sample,
-        output,
-        context="two_dimensional",
+        bundle, sample, output, context="two_dimensional", bundle_path=bundle_path
     )
     fig = go.Figure(
         data=go.Heatmap(
@@ -1546,10 +1592,7 @@ def _exact_grid_comparison_page(
     # Exact-grid comparison uses bundle bounds for its initial y-axis range.
     sample = pd.DataFrame()
     y_range = _output_axis_control(
-        bundle,
-        sample,
-        output,
-        context="exact_comparison",
+        bundle, sample, output, context="exact_comparison", bundle_path=bundle_path
     )
     model_base = _model_base_from_catalog_row(bundle, base, selected_row)
     policy_layout = str(bundle.training_metadata.get("policy_layout", "GHKEBA"))
