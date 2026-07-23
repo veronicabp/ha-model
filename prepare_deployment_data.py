@@ -5,8 +5,8 @@ import shutil
 from pathlib import Path
 
 import joblib
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 # ---------------------------------------------------------------------
 # Change these paths.
@@ -15,7 +15,9 @@ import numpy as np
 SURROGATE_DIR = Path(
     "/Users/vbp/Dropbox (Personal)/research/research-data/iceland-data/ha_smooth"
 )
-DEPLOY_DIR = Path("/Users/vbp/Dropbox (Personal)/research/github-projects/ha-model")
+DEPLOY_DIR = Path(
+    "/Users/vbp/Dropbox (Personal)/research/github-projects/ha-model"
+)
 
 MAX_PUBLIC_MODELS = 500
 PINNED_MODEL_IDS: list[str] = []
@@ -39,7 +41,8 @@ catalog["model_id"] = catalog["model_id"].astype(str)
 
 split = metrics["split"].astype(str).str.lower()
 held_out = metrics[
-    split.str.contains("held", na=False) | split.str.contains("test", na=False)
+    split.str.contains("held", na=False)
+    | split.str.contains("test", na=False)
 ].copy()
 
 if held_out.empty:
@@ -59,7 +62,9 @@ ranked = ranked.sort_values(["mean_r2", "model_id"], ascending=[False, True])
 
 available_ids = set(catalog["model_id"])
 pinned = [
-    str(model_id) for model_id in PINNED_MODEL_IDS if str(model_id) in available_ids
+    str(model_id)
+    for model_id in PINNED_MODEL_IDS
+    if str(model_id) in available_ids
 ]
 remaining = [
     model_id
@@ -99,8 +104,8 @@ for row in public_catalog.itertuples(index=False):
             raise FileNotFoundError(f"Missing required model file: {source}")
         shutil.copy2(source, destination_dir / filename)
 
-public_catalog["model_dir"] = "held_out_models/" + public_catalog["model_id"].astype(
-    str
+public_catalog["model_dir"] = (
+    "held_out_models/" + public_catalog["model_id"].astype(str)
 )
 public_catalog.to_csv(APP_DATA_DIR / "model_catalog.csv", index=False)
 
@@ -131,15 +136,7 @@ elif sample_path.suffix in {".pkl", ".pickle"}:
 else:
     sample = pd.read_csv(sample_path)
 
-sample["model_id"] = sample["model_id"].astype(str)
-pair_id = pd.to_numeric(sample["mpc_pair_id"], errors="coerce")
-pair_role = pd.to_numeric(sample["mpc_pair_role"], errors="coerce")
-
-keep = sample["model_id"].isin(public_ids) & pair_id.ge(0) & pair_role.isin([0, 1])
-heldout_pairs = sample.loc[keep].copy()
-
-# Data for axes
-# Old website default axis ranges: 0.5th to 99.5th percentiles.
+# Preserve the old website axis defaults without deploying the full sample.
 policy_outputs = [
     "consumption",
     "deposit",
@@ -148,19 +145,12 @@ policy_outputs = [
     "next_liquid_assets",
     "next_illiquid_assets",
 ]
-
-axis_rows = []
-
+axis_rows: list[dict[str, float | str]] = []
 for output in policy_outputs:
     if output not in sample:
         continue
-
-    values = pd.to_numeric(
-        sample[output],
-        errors="coerce",
-    )
+    values = pd.to_numeric(sample[output], errors="coerce")
     values = values[np.isfinite(values)]
-
     if len(values):
         axis_rows.append(
             {
@@ -170,11 +160,21 @@ for output in policy_outputs:
             }
         )
 
-pd.DataFrame(axis_rows).to_csv(
-    APP_DATA_DIR / "output_axis_ranges.csv",
-    index=False,
-)
+axis_table = pd.DataFrame(axis_rows)
+if axis_table.empty:
+    raise RuntimeError("Could not construct output-axis ranges from the sample.")
+axis_table.to_csv(APP_DATA_DIR / "output_axis_ranges.csv", index=False)
 
+sample["model_id"] = sample["model_id"].astype(str)
+pair_id = pd.to_numeric(sample["mpc_pair_id"], errors="coerce")
+pair_role = pd.to_numeric(sample["mpc_pair_role"], errors="coerce")
+
+keep = (
+    sample["model_id"].isin(public_ids)
+    & pair_id.ge(0)
+    & pair_role.isin([0, 1])
+)
+heldout_pairs = sample.loc[keep].copy()
 del sample
 
 if heldout_pairs.empty:
@@ -184,7 +184,6 @@ heldout_pairs.to_parquet(
     APP_DATA_DIR / "heldout_mpc_pairs.parquet",
     index=False,
 )
-
 
 # Remove obsolete full-sample files from the deployment directory.
 for filename in (
@@ -200,6 +199,7 @@ for filename in (
 print(f"Deployment data created in: {APP_DATA_DIR}")
 print(f"Exact held-out models copied: {len(public_catalog):,}")
 print(f"Held-out MPC-pair rows: {len(heldout_pairs):,}")
+print(f"Output-axis ranges saved: {len(axis_table):,}")
 print(
     "Reduced validation file size: "
     f"{(APP_DATA_DIR / 'heldout_mpc_pairs.parquet').stat().st_size / 1024**2:.1f} MB"

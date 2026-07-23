@@ -123,6 +123,46 @@ def _load_training_sample(bundle_path: str) -> pd.DataFrame:
     return read_policy_dataset(path) if path is not None else pd.DataFrame()
 
 
+@st.cache_data(show_spinner=False, max_entries=1)
+def _load_output_axis_ranges(
+    bundle_path: str,
+    file_signature: int | None,
+) -> dict[str, tuple[float, float]]:
+    """Load compact quantile-based output ranges saved beside the bundle."""
+
+    del file_signature  # Used only to invalidate the cache when the file changes.
+    path = (
+        Path(bundle_path).expanduser().resolve().parent
+        / "output_axis_ranges.csv"
+    )
+    if not path.exists():
+        return {}
+
+    table = pd.read_csv(path)
+    required = {"output", "lower", "upper"}
+    if not required.issubset(table.columns):
+        return {}
+
+    ranges: dict[str, tuple[float, float]] = {}
+    for row in table.itertuples(index=False):
+        lo = float(row.lower)
+        hi = float(row.upper)
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            ranges[str(row.output)] = (lo, hi)
+    return ranges
+
+
+def _stored_output_axis_ranges(
+    bundle_path: str | Path,
+) -> dict[str, tuple[float, float]]:
+    path = (
+        Path(bundle_path).expanduser().resolve().parent
+        / "output_axis_ranges.csv"
+    )
+    signature = int(path.stat().st_mtime_ns) if path.exists() else None
+    return _load_output_axis_ranges(str(bundle_path), signature)
+
+
 @st.cache_data(show_spinner=False)
 def _load_model_catalog(bundle_path: str) -> pd.DataFrame:
     catalog_path = Path(bundle_path).expanduser().resolve().parent / "model_catalog.csv"
@@ -143,33 +183,6 @@ def _load_model_catalog(bundle_path: str) -> pd.DataFrame:
         raise ValueError("model_catalog.csv contains no usable models.")
 
     return catalog.reset_index(drop=True)
-
-
-@st.cache_data(show_spinner=False)
-def _load_output_axis_ranges(
-    bundle_path: str,
-) -> dict[str, tuple[float, float]]:
-    path = Path(bundle_path).expanduser().resolve().parent / "output_axis_ranges.csv"
-
-    if not path.exists():
-        return {}
-
-    table = pd.read_csv(path)
-
-    required = {"output", "lower", "upper"}
-    if not required.issubset(table.columns):
-        return {}
-
-    ranges = {}
-
-    for row in table.itertuples(index=False):
-        lo = float(row.lower)
-        hi = float(row.upper)
-
-        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
-            ranges[str(row.output)] = (lo, hi)
-
-    return ranges
 
 
 def _out_of_sample_model_summary(
@@ -278,19 +291,9 @@ def _default_output_range(
     stored_ranges = stored_ranges or {}
 
     if output in stored_ranges:
-        lo, hi = stored_ranges[output]
+        lo, hi = map(float, stored_ranges[output])
 
     elif not sample.empty and output in sample:
-        values = pd.to_numeric(sample[output], errors="coerce")
-        values = values[np.isfinite(values)]
-
-        if len(values):
-            lo = float(values.quantile(0.005))
-            hi = float(values.quantile(0.995))
-        else:
-            lo, hi = -1.0, 1.0
-
-    if not sample.empty and output in sample:
         values = pd.to_numeric(sample[output], errors="coerce")
         values = values[np.isfinite(values)]
 
@@ -329,6 +332,20 @@ def _default_output_range(
     return lo - padding, hi + padding
 
 
+def _reset_output_axis_state(
+    range_key: str,
+    min_widget_key: str,
+    max_widget_key: str,
+    default_range: tuple[float, float],
+) -> None:
+    """Reset axis widgets before Streamlit instantiates them on the rerun."""
+
+    lo, hi = map(float, default_range)
+    st.session_state[range_key] = (lo, hi)
+    st.session_state[min_widget_key] = lo
+    st.session_state[max_widget_key] = hi
+
+
 def _output_axis_control(
     bundle: PolicySurrogateBundle,
     sample: pd.DataFrame,
@@ -339,8 +356,7 @@ def _output_axis_control(
 ) -> tuple[float, float]:
     """Persistent axis limits that do not change when other controls move."""
 
-    stored_ranges = _load_output_axis_ranges(str(bundle_path))
-
+    stored_ranges = _stored_output_axis_ranges(bundle_path)
     default_range = _default_output_range(
         bundle,
         sample,
@@ -351,9 +367,20 @@ def _output_axis_control(
     range_key = f"{context}__fixed_output_range__{output}"
     min_widget_key = f"{context}__ymin__{output}"
     max_widget_key = f"{context}__ymax__{output}"
+    default_key = f"{context}__axis_default__{output}"
 
-    if range_key not in st.session_state:
-        st.session_state[range_key] = default_range
+    normalized_default = tuple(round(float(x), 12) for x in default_range)
+    previous_default = st.session_state.get(default_key)
+
+    # Refresh stale full-range state when output_axis_ranges.csv first appears
+    # or is replaced. User edits remain persistent while the default is unchanged.
+    if previous_default != normalized_default:
+        st.session_state[default_key] = normalized_default
+        st.session_state[range_key] = tuple(map(float, default_range))
+        st.session_state[min_widget_key] = float(default_range[0])
+        st.session_state[max_widget_key] = float(default_range[1])
+    elif range_key not in st.session_state:
+        st.session_state[range_key] = tuple(map(float, default_range))
 
     current_lo, current_hi = st.session_state[range_key]
 
@@ -384,15 +411,18 @@ def _output_axis_control(
         else:
             st.session_state[range_key] = (float(lo), float(hi))
 
-        if st.button(
+        st.button(
             "Reset to data range",
-            key=f"{context}__reset_y__{output}",
-            use_container_width=True,
-        ):
-            st.session_state[range_key] = default_range
-            st.session_state[min_widget_key] = float(default_range[0])
-            st.session_state[max_widget_key] = float(default_range[1])
-            st.rerun()
+            key=f"{context}__reset_y__{output}__v2",
+            width="stretch",
+            on_click=_reset_output_axis_state,
+            args=(
+                range_key,
+                min_widget_key,
+                max_widget_key,
+                default_range,
+            ),
+        )
 
     return tuple(st.session_state[range_key])
 
@@ -553,11 +583,17 @@ def _base_controls(
             continue
         default_str = str(base.get(col, info.get("mode", values[0])))
         index = values.index(default_str) if default_str in values else 0
+        widget_key = f"cat_param_v2_{col}"
+        if (
+            widget_key in st.session_state
+            and st.session_state[widget_key] not in values
+        ):
+            st.session_state.pop(widget_key, None)
         base[col] = st.sidebar.selectbox(
             _pretty(col),
             values,
             index=index,
-            key=f"cat_param_{col}",
+            key=widget_key,
         )
 
     st.sidebar.header("State held fixed")
@@ -605,8 +641,17 @@ def _base_controls(
             continue
         default_str = str(base.get(col, info.get("mode", values[0])))
         index = values.index(default_str) if default_str in values else 0
+        widget_key = f"cat_state_v2_{col}"
+        if (
+            widget_key in st.session_state
+            and st.session_state[widget_key] not in values
+        ):
+            st.session_state.pop(widget_key, None)
         base[col] = st.sidebar.selectbox(
-            _pretty(col), values, index=index, key=f"cat_state_{col}"
+            _pretty(col),
+            values,
+            index=index,
+            key=widget_key,
         )
 
     for col in (
@@ -884,7 +929,11 @@ def _one_dimensional_page(
     # Bundle-level output bounds provide stable axes without a large DataFrame.
     sample = pd.DataFrame()
     y_range = _output_axis_control(
-        bundle, sample, output, context="one_dimensional", bundle_path=bundle_path
+        bundle,
+        sample,
+        output,
+        context="one_dimensional",
+        bundle_path=bundle_path,
     )
 
     fig = _line_slice(
@@ -898,7 +947,7 @@ def _one_dimensional_page(
         linked_income=linked_income,
         y_range=y_range,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     with st.expander("Fixed values used in this slice"):
         display = pd.DataFrame(
@@ -908,7 +957,7 @@ def _one_dimensional_page(
             },
             dtype="string",
         )
-        st.dataframe(display, hide_index=True, use_container_width=True)
+        st.dataframe(display, hide_index=True, width="stretch")
 
 
 def _surface_page(
@@ -991,7 +1040,11 @@ def _surface_page(
     # Avoid loading the full sampled grid merely to initialize the color scale.
     sample = pd.DataFrame()
     z_range = _output_axis_control(
-        bundle, sample, output, context="two_dimensional", bundle_path=bundle_path
+        bundle,
+        sample,
+        output,
+        context="two_dimensional",
+        bundle_path=bundle_path,
     )
     fig = go.Figure(
         data=go.Heatmap(
@@ -1011,7 +1064,7 @@ def _surface_page(
         yaxis_title=_pretty(y),
         margin=dict(l=40, r=20, t=30, b=40),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def _mpc_histogram_figure(
@@ -1310,7 +1363,7 @@ def _mpc_distribution_page(
         reference=reference,
         check_amount_dollars=float(check_amount),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.download_button(
         "Download household MPCs as CSV",
         data=response.to_csv(index=False).encode("utf-8"),
@@ -1353,7 +1406,7 @@ def _mpc_distribution_page(
         .sort_values("mean_mpc", ascending=False)
     )
     with st.expander("MPCs and state diagnostics by population type"):
-        st.dataframe(subgroup, hide_index=True, use_container_width=True)
+        st.dataframe(subgroup, hide_index=True, width="stretch")
         diagnostics = pd.DataFrame(
             {
                 "statistic": [
@@ -1370,7 +1423,7 @@ def _mpc_distribution_page(
                 ],
             }
         )
-        st.dataframe(diagnostics, hide_index=True, use_container_width=True)
+        st.dataframe(diagnostics, hide_index=True, width="stretch")
 
 
 def _resolve_model_dir(
@@ -1455,7 +1508,7 @@ def _held_out_model_selector(
     st.dataframe(
         display_summary,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Consumption R²": st.column_config.NumberColumn(format="%.4f"),
             "Deposit R²": st.column_config.NumberColumn(format="%.4f"),
@@ -1530,7 +1583,7 @@ def _held_out_model_selector(
         st.dataframe(
             _model_parameter_table(catalog, selected_row),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
     return catalog, selected_row, selected_summary, model_dir
 
@@ -1592,7 +1645,11 @@ def _exact_grid_comparison_page(
     # Exact-grid comparison uses bundle bounds for its initial y-axis range.
     sample = pd.DataFrame()
     y_range = _output_axis_control(
-        bundle, sample, output, context="exact_comparison", bundle_path=bundle_path
+        bundle,
+        sample,
+        output,
+        context="exact_comparison",
+        bundle_path=bundle_path,
     )
     model_base = _model_base_from_catalog_row(bundle, base, selected_row)
     policy_layout = str(bundle.training_metadata.get("policy_layout", "GHKEBA"))
@@ -1670,7 +1727,7 @@ def _exact_grid_comparison_page(
         legend_title="Policy source",
         margin=dict(l=40, r=20, t=40, b=40),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     rmse = float(np.sqrt(np.mean(comparison["error"] ** 2)))
     max_error = float(comparison["error"].abs().max())
@@ -1679,7 +1736,7 @@ def _exact_grid_comparison_page(
     m2.metric("Slice RMSE", f"{rmse:.6g}")
     m3.metric("Maximum absolute error", f"{max_error:.6g}")
     with st.expander("Comparison data"):
-        st.dataframe(comparison, hide_index=True, use_container_width=True)
+        st.dataframe(comparison, hide_index=True, width="stretch")
 
 
 def _model_surrogate_mpc_histogram(
@@ -1992,7 +2049,7 @@ def _mpc_grid_comparison_page(
         surrogate_response,
         check_amount_dollars=float(check_amount),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     comparison = pd.DataFrame(
         {
@@ -2038,8 +2095,8 @@ def _mpc_grid_comparison_page(
         .sort_values("model_mean_mpc", ascending=False)
     )
     with st.expander("Paired MPC diagnostics", expanded=False):
-        st.dataframe(paired_summary, hide_index=True, use_container_width=True)
-        st.dataframe(subgroup, hide_index=True, use_container_width=True)
+        st.dataframe(paired_summary, hide_index=True, width="stretch")
+        st.dataframe(subgroup, hide_index=True, width="stretch")
         st.download_button(
             "Download paired household MPCs as CSV",
             data=paired.to_csv(index=False).encode("utf-8"),
@@ -2647,7 +2704,7 @@ def _validation_mpc_binscatter(
         legend_title="Policy source",
         margin=dict(l=45, r=20, t=65, b=45),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     fig_error = go.Figure()
     fig_error.add_trace(
@@ -2694,7 +2751,7 @@ def _validation_mpc_binscatter(
         legend_title="Diagnostic",
         margin=dict(l=45, r=20, t=65, b=45),
     )
-    st.plotly_chart(fig_error, use_container_width=True)
+    st.plotly_chart(fig_error, width="stretch")
 
     st.caption(
         f"Largest absolute binned bias: {worst['mean_error']:+.4f} around "
@@ -2730,7 +2787,7 @@ def _validation_mpc_binscatter(
         ]
     ]
     with st.expander("Binned MPC comparison data", expanded=False):
-        st.dataframe(display, hide_index=True, use_container_width=True)
+        st.dataframe(display, hide_index=True, width="stretch")
         st.download_button(
             "Download binned MPC comparison as CSV",
             data=display.to_csv(index=False).encode("utf-8"),
@@ -2751,7 +2808,7 @@ def _validation_page(
         "asset changes are reconstructed from the accounting equations. Asset "
         "rows include persistence or zero-change benchmarks."
     )
-    st.dataframe(bundle.validation_metrics, hide_index=True, use_container_width=True)
+    st.dataframe(bundle.validation_metrics, hide_index=True, width="stretch")
     metrics = bundle.validation_metrics
     fig = go.Figure()
     fig.add_trace(
@@ -2779,7 +2836,7 @@ def _validation_page(
         xaxis_title="Policy choice",
         barmode="group",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     if "skill_vs_benchmark" in metrics:
         skill = metrics[metrics["skill_vs_benchmark"].notna()]
@@ -2799,7 +2856,7 @@ def _validation_page(
                 xaxis_title="Policy choice",
                 title="Improvement over persistence or zero change",
             )
-            st.plotly_chart(fig_skill, use_container_width=True)
+            st.plotly_chart(fig_skill, width="stretch")
 
     if not bundle.validation_by_model.empty:
         st.subheader("Error distribution across held-out models")
@@ -2814,8 +2871,8 @@ def _validation_page(
         ].sort_values("rmse")
         fig2 = go.Figure(go.Box(y=d["rmse"], boxpoints="all", name=_pretty(chosen)))
         fig2.update_layout(template="plotly_white", height=430, yaxis_title="RMSE")
-        st.plotly_chart(fig2, use_container_width=True)
-        st.dataframe(d, hide_index=True, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
+        st.dataframe(d, hide_index=True, width="stretch")
 
     _validation_mpc_binscatter(
         bundle,
@@ -2886,68 +2943,61 @@ def main() -> None:
     base_frame = bundle.prepare_inputs(pd.DataFrame([base]))
     base.update(base_frame.iloc[0].to_dict())
 
-    tabs = st.tabs(
-        [
-            "One-dimensional slices",
-            "Two-dimensional surfaces",
-            "MPC distribution",
-            "Grid versus polynomial",
-            "MPCs: grid versus polynomial",
-            "Validation",
-        ],
-        key="main_tabs",
-        on_change="rerun",
+    page_names = [
+        "One-dimensional slices",
+        "Two-dimensional surfaces",
+        "MPC distribution",
+        "Grid versus polynomial",
+        "MPCs: grid versus polynomial",
+        "Validation",
+    ]
+
+    # Use an ordinary widget rather than dynamic tabs.  Only the selected page
+    # is executed, preserving the low-memory behavior without dynamic-tab
+    # widget-state churn across reruns.
+    selected_page = st.radio(
+        "Page",
+        page_names,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="main_page",
     )
 
-    # Streamlit otherwise evaluates every tab on every rerun.  Rendering only
-    # the open tab keeps exact grids, synthetic populations, and validation data
-    # out of memory until the user actually requests them.
-    if tabs[0].open:
-        with tabs[0]:
-            _one_dimensional_page(
-                bundle,
-                base,
-                bundle_path=bundle_path,
-            )
-
-    if tabs[1].open:
-        with tabs[1]:
-            _surface_page(
-                bundle,
-                base,
-                bundle_path=bundle_path,
-            )
-
-    if tabs[2].open:
-        with tabs[2]:
-            _mpc_distribution_page(
-                bundle,
-                base,
-                bundle_path=bundle_path,
-            )
-
-    if tabs[3].open:
-        with tabs[3]:
-            _exact_grid_comparison_page(
-                bundle,
-                base,
-                bundle_path=bundle_path,
-            )
-
-    if tabs[4].open:
-        with tabs[4]:
-            _mpc_grid_comparison_page(
-                bundle,
-                base,
-                bundle_path=bundle_path,
-            )
-
-    if tabs[5].open:
-        with tabs[5]:
-            _validation_page(
-                bundle,
-                bundle_path=bundle_path,
-            )
+    if selected_page == "One-dimensional slices":
+        _one_dimensional_page(
+            bundle,
+            base,
+            bundle_path=bundle_path,
+        )
+    elif selected_page == "Two-dimensional surfaces":
+        _surface_page(
+            bundle,
+            base,
+            bundle_path=bundle_path,
+        )
+    elif selected_page == "MPC distribution":
+        _mpc_distribution_page(
+            bundle,
+            base,
+            bundle_path=bundle_path,
+        )
+    elif selected_page == "Grid versus polynomial":
+        _exact_grid_comparison_page(
+            bundle,
+            base,
+            bundle_path=bundle_path,
+        )
+    elif selected_page == "MPCs: grid versus polynomial":
+        _mpc_grid_comparison_page(
+            bundle,
+            base,
+            bundle_path=bundle_path,
+        )
+    else:
+        _validation_page(
+            bundle,
+            bundle_path=bundle_path,
+        )
 
 
 if __name__ == "__main__":
