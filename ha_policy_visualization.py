@@ -100,57 +100,222 @@ def set_plot_axis(
     return out
 
 
+def _numeric_income_setting(
+    bundle: PolicySurrogateBundle,
+    frame: pd.DataFrame,
+    base: Mapping[str, Any],
+    candidates: Sequence[str],
+    *,
+    default: float,
+) -> np.ndarray:
+    """Resolve a row-specific income-process parameter with stable fallbacks."""
+
+    n = len(frame)
+    for column in candidates:
+        if column in frame:
+            values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+            fallback = float(base.get(column, bundle.default_values.get(column, default)))
+            return np.where(np.isfinite(values), values, fallback)
+
+        for source in (
+            base,
+            bundle.default_values,
+            bundle.accounting_defaults,
+        ):
+            if column not in source:
+                continue
+            try:
+                value = float(source[column])
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                return np.full(n, value, dtype=float)
+
+        info = bundle.feature_ranges.get(column, {})
+        try:
+            value = float(info.get("median", np.nan))
+        except (TypeError, ValueError):
+            value = np.nan
+        if np.isfinite(value):
+            return np.full(n, value, dtype=float)
+
+    return np.full(n, float(default), dtype=float)
+
+
+def _employment_is_employed(
+    frame: pd.DataFrame,
+    base: Mapping[str, Any],
+    bundle: PolicySurrogateBundle,
+) -> np.ndarray:
+    """Return the model's employment indicator: state 0 is employed."""
+
+    if "employment_state" in frame:
+        raw = frame["employment_state"]
+    else:
+        raw = pd.Series(
+            base.get(
+                "employment_state",
+                bundle.default_values.get("employment_state", 0),
+            ),
+            index=frame.index,
+        )
+
+    numeric = pd.to_numeric(raw, errors="coerce").to_numpy(dtype=float)
+    text = raw.astype(str).str.strip().str.lower().to_numpy(dtype=object)
+    employed_text = np.isin(
+        text,
+        ["0", "0.0", "employed", "working", "true"],
+    )
+    return np.where(np.isfinite(numeric), numeric == 0.0, employed_text)
+
+
 def link_labor_income_state(
     bundle: PolicySurrogateBundle,
     frame: pd.DataFrame,
     varied_income: np.ndarray,
     base: Mapping[str, Any],
 ) -> pd.DataFrame:
-    """Link hidden income variables to the public pre-tax-income control.
+    """Infer persistent income from pre-tax income, age, and employment.
 
-    The latent permanent-income state and disposable income move in the same
-    proportion as pre-tax income. The latter is passed through an internal
-    override that ``PolicySurrogateBundle.prepare_inputs`` recognizes.
+    In the solved model, working-age gross income is
+
+        current_income
+        = labor_income_state * age_profile(age)
+          * employment_multiplier,
+
+    where the employment multiplier equals one for employed households and the
+    unemployment replacement rate for unemployed households.  Consequently,
+    the latent persistent-income state is pinned down exactly once pre-tax
+    income, age, employment, and the selected income-process parameters are
+    known.  The website therefore does not need a separate income-deviation
+    control.
+
+    The age profile matches ``ha_model_grid.age_profile``:
+
+        exp(slope * ((age - 45) / 20)
+            + quadratic * ((age - 45) / 20)**2).
+
+    The default quadratic and replacement rates below are the structural-model
+    defaults and are used only when a constant parameter was omitted from the
+    fitted surrogate's varying-parameter metadata.
     """
 
     out = frame.copy()
     current = np.asarray(varied_income, dtype=float)
-    anchor_income = float(
-        base.get(
-            "current_income",
-            bundle.default_values.get(
-                "current_income",
-                bundle.feature_ranges["current_income"].get("median", 1.0),
+    if current.ndim == 0:
+        current = np.full(len(out), float(current), dtype=float)
+    if len(current) != len(out):
+        raise ValueError(
+            "Pre-tax income has the wrong number of rows for income-state linking."
+        )
+    if np.any(~np.isfinite(current)) or np.any(current < 0.0):
+        raise ValueError("Pre-tax income must be finite and nonnegative.")
+
+    out["current_income"] = current
+    out["gross_income"] = current
+    # Remove the old proportional disposable-income override.  The bundle's
+    # accounting code should calculate after-tax income from the selected tax
+    # schedule and the structurally consistent gross-income state.
+    out = out.drop(columns=["__after_tax_income_override"], errors="ignore")
+
+    age = pd.to_numeric(
+        out.get(
+            "age",
+            pd.Series(
+                base.get("age", bundle.default_values.get("age", 45.0)),
+                index=out.index,
             ),
-        )
+        ),
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    if np.any(~np.isfinite(age)):
+        raise ValueError("Age must be finite to infer the persistent-income state.")
+
+    slope = _numeric_income_setting(
+        bundle,
+        out,
+        base,
+        (
+            "param__policy__income__age_profile_slope",
+            "param__config__age_profile_slope",
+            "age_profile_slope",
+        ),
+        default=0.25,
     )
-    if not np.isfinite(anchor_income) or abs(anchor_income) <= 1.0e-12:
-        anchor_income = float(
-            bundle.feature_ranges["current_income"].get("median", 1.0)
+    quadratic = _numeric_income_setting(
+        bundle,
+        out,
+        base,
+        (
+            "param__policy__income__age_profile_quadratic",
+            "param__config__age_profile_quadratic",
+            "age_profile_quadratic",
+        ),
+        default=-0.10,
+    )
+    unemployment_replacement = _numeric_income_setting(
+        bundle,
+        out,
+        base,
+        (
+            "param__policy__employment__unemployment_replacement_rate",
+            "param__config__unemployment_replacement_rate",
+            "unemployment_replacement_rate",
+        ),
+        default=0.50,
+    )
+    pension_replacement = _numeric_income_setting(
+        bundle,
+        out,
+        base,
+        (
+            "param__policy__pension__replacement_rate",
+            "param__config__pension_replacement_rate",
+            "pension_replacement_rate",
+        ),
+        default=0.45,
+    )
+    retirement_age = _numeric_income_setting(
+        bundle,
+        out,
+        base,
+        (
+            "param__config__retirement_age",
+            "acct__retirement_age",
+            "retirement_age",
+        ),
+        default=65.0,
+    )
+
+    age_position = (age - 45.0) / 20.0
+    age_multiplier = np.exp(
+        slope * age_position + quadratic * age_position**2
+    )
+
+    employed = _employment_is_employed(out, base, bundle)
+    working_multiplier = age_multiplier * np.where(
+        employed,
+        1.0,
+        unemployment_replacement,
+    )
+
+    # The website is normally restricted to working-age households.  This
+    # branch keeps the helper correct if a retired row is supplied elsewhere.
+    retirement_position = (retirement_age - 45.0) / 20.0
+    retirement_profile = np.exp(
+        slope * retirement_position + quadratic * retirement_position**2
+    )
+    retired_multiplier = pension_replacement * retirement_profile
+    multiplier = np.where(age >= retirement_age, retired_multiplier, working_multiplier)
+
+    if np.any(~np.isfinite(multiplier)) or np.any(multiplier <= 1.0e-12):
+        raise ValueError(
+            "The selected age/employment parameters imply a zero or invalid "
+            "gross-income multiplier, so persistent income cannot be inferred."
         )
-    if not np.isfinite(anchor_income) or abs(anchor_income) <= 1.0e-12:
-        anchor_income = 1.0
-    scale = current / anchor_income
 
     if "labor_income_state" in bundle.feature_spec.state_columns:
-        anchor_labor_state = float(
-            base.get(
-                "labor_income_state",
-                bundle.default_values.get("labor_income_state", anchor_income),
-            )
-        )
-        if not np.isfinite(anchor_labor_state):
-            anchor_labor_state = anchor_income
-        out["labor_income_state"] = anchor_labor_state * scale
-
-    anchor_after_tax = float(
-        base.get(
-            "after_tax_income",
-            bundle.default_values.get("after_tax_income", anchor_income),
-        )
-    )
-    if np.isfinite(anchor_after_tax):
-        out["__after_tax_income_override"] = np.maximum(anchor_after_tax * scale, 0.0)
+        out["labor_income_state"] = current / multiplier
 
     return out
 
@@ -581,9 +746,10 @@ def make_policy_slice(
 ) -> pd.DataFrame:
     """Evaluate a one-dimensional policy slice.
 
-    Pre-tax income is the public income control. When it varies, the latent
-    labor-income state and disposable income move proportionally from the
-    selected baseline state.
+    Pre-tax income is the public income control.  Unless persistent income is
+    itself the requested axis, the latent labor-income state is inferred from
+    each row's pre-tax income, age, employment state, and selected structural
+    parameters before normalized asset axes are translated into levels.
     """
 
     if x not in bundle.feature_ranges:
@@ -602,29 +768,26 @@ def make_policy_slice(
 
     frame = pd.DataFrame([base_row] * len(values_array))
 
-    # Primitive variables must be assigned before income linking.
+    # Primitive variables must be assigned before persistent income is inferred.
     if x not in DERIVED_ASSET_AXES:
-        frame = set_plot_axis(
-            frame,
-            x,
-            values_array,
-        )
+        frame = set_plot_axis(frame, x, values_array)
 
-    if linked_income and x == "current_income":
+    if linked_income and x != "labor_income_state":
+        current = pd.to_numeric(
+            frame["current_income"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
         frame = link_labor_income_state(
             bundle,
             frame,
-            values_array,
+            current,
             base_row,
         )
 
-    # Derived ratios must be translated after all income variables are finalized.
+    # Ratios are translated only after permanent income has been determined.
     if x in DERIVED_ASSET_AXES:
-        frame = set_plot_axis(
-            frame,
-            x,
-            values_array,
-        )
+        frame = set_plot_axis(frame, x, values_array)
+
     frame = complete_derived_state(frame)
     pred = bundle.predict(frame)
     return pd.concat(
@@ -647,8 +810,10 @@ def make_policy_surface(
 ) -> pd.DataFrame:
     """Evaluate a rectangular two-dimensional policy surface.
 
-    Varying pre-tax income also moves the latent labor-income state and
-    disposable income in the same proportion as in the base row.
+    For every row of the surface, persistent income is inferred from pre-tax
+    income, age, and employment before normalized asset axes are converted into
+    primitive asset levels.  This keeps age and employment surfaces on the
+    structural income process rather than on an arbitrary income-deviation path.
     """
 
     if x == y:
@@ -675,41 +840,32 @@ def make_policy_surface(
     xx, yy = np.meshgrid(xv, yv)
 
     frame = pd.DataFrame([base_row] * xx.size)
+    axis_values = {x: xx.ravel(), y: yy.ravel()}
 
-    axis_values = {
-        x: xx.ravel(),
-        y: yy.ravel(),
-    }
-
-    # First assign all primitive states and parameters.
-    for variable, values in axis_values.items():
+    # First assign primitive states and parameters, including age and income.
+    for variable, axis_value in axis_values.items():
         if variable not in DERIVED_ASSET_AXES:
-            frame = set_plot_axis(
-                frame,
-                variable,
-                values,
-            )
+            frame = set_plot_axis(frame, variable, axis_value)
 
-    # Link latent income after assigning current income.
-    if linked_income and "current_income" in {x, y}:
+    if linked_income and "labor_income_state" not in {x, y}:
+        current = pd.to_numeric(
+            frame["current_income"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
         frame = link_labor_income_state(
             bundle,
             frame,
-            frame["current_income"].to_numpy(dtype=float),
+            current,
             base_row,
         )
 
-    # Translate ratios after income and borrowing-limit values are finalized.
-    for variable, values in axis_values.items():
+    # Translate normalized asset axes using the structurally implied permanent
+    # income for each row of the surface.
+    for variable, axis_value in axis_values.items():
         if variable in DERIVED_ASSET_AXES:
-            frame = set_plot_axis(
-                frame,
-                variable,
-                values,
-            )
+            frame = set_plot_axis(frame, variable, axis_value)
 
     frame = complete_derived_state(frame)
-
     pred = bundle.predict(frame)
     out = pd.concat(
         [frame.reset_index(drop=True), pred.add_prefix("pred_").reset_index(drop=True)],

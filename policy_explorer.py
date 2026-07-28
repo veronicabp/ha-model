@@ -59,6 +59,7 @@ from ha_surrogate_backend import (
 from ha_policy_visualization import (
     DERIVED_ASSET_AXES,
     complete_derived_state,
+    link_labor_income_state as _structural_income_link,
     load_exact_grid_slice,
     make_policy_surface,
     set_plot_axis,
@@ -101,11 +102,7 @@ SPECIAL_LABELS = {
     "illiquid_assets_to_income": "Illiquid Assets / Permanent Income",
     "liquid_slack_to_income": "Liquid Slack / Permanent Income",
     "mpc": "Marginal Propensity to Consume",
-    "income_deviation": "Income Deviation",
 }
-
-
-INCOME_DEVIATION_COLUMN = "income_deviation"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -500,18 +497,72 @@ def _default_output_range(
     return lo - padding, hi + padding
 
 
-def _reset_output_axis_state(
-    range_key: str,
-    min_widget_key: str,
-    max_widget_key: str,
+def _output_axis_slider_bounds(
+    bundle: SurrogateBundle,
+    sample: pd.DataFrame,
+    output: str,
     default_range: tuple[float, float],
-) -> None:
-    """Reset axis widgets before Streamlit instantiates them on the rerun."""
+) -> tuple[float, float]:
+    """Full support offered by the output-range slider.
 
-    lo, hi = map(float, default_range)
-    st.session_state[range_key] = (lo, hi)
-    st.session_state[min_widget_key] = lo
-    st.session_state[max_widget_key] = hi
+    The selected slider interval starts at the stable quantile-based display
+    range, while the slider endpoints use the broadest available target bounds.
+    This mirrors the state-axis controls, whose default interval is narrower
+    than the full numerical support.
+    """
+
+    candidates: list[tuple[float, float]] = [tuple(map(float, default_range))]
+
+    if not sample.empty and output in sample:
+        values = pd.to_numeric(sample[output], errors="coerce")
+        values = values[np.isfinite(values)]
+        if len(values):
+            candidates.append((float(values.min()), float(values.max())))
+
+    if output in bundle.output_bounds:
+        candidates.append(tuple(map(float, bundle.output_bounds[output])))
+    elif output == "delta_liquid_assets":
+        next_lo, next_hi = bundle.output_bounds["next_liquid_assets"]
+        current = bundle.feature_ranges["liquid_assets"]
+        candidates.append(
+            (
+                float(next_lo) - float(current["max"]),
+                float(next_hi) - float(current["min"]),
+            )
+        )
+    elif output == "delta_illiquid_assets":
+        next_lo, next_hi = bundle.output_bounds["next_illiquid_assets"]
+        current = bundle.feature_ranges["illiquid_assets"]
+        candidates.append(
+            (
+                float(next_lo) - float(current["max"]),
+                float(next_hi) - float(current["min"]),
+            )
+        )
+    elif output == "mpc":
+        candidates.append((-0.50, 1.50))
+
+    finite = [
+        (lo, hi)
+        for lo, hi in candidates
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo
+    ]
+    default_lo, default_hi = map(float, default_range)
+    if not finite:
+        finite = [(default_lo, default_hi)]
+
+    lower = min(lo for lo, _ in finite)
+    upper = max(hi for _, hi in finite)
+    default_span = max(default_hi - default_lo, 1.0e-8)
+
+    # If the bundle exposes no wider support, still give the user room to move
+    # the display window rather than presenting a range slider with no travel.
+    if upper - lower <= 1.01 * default_span:
+        lower = min(lower, default_lo - 0.50 * default_span)
+        upper = max(upper, default_hi + 0.50 * default_span)
+
+    padding = 0.02 * max(upper - lower, default_span)
+    return float(lower - padding), float(upper + padding)
 
 
 def _output_axis_control(
@@ -522,7 +573,7 @@ def _output_axis_control(
     context: str,
     bundle_path: str | Path,
 ) -> tuple[float, float]:
-    """Persistent axis limits that do not change when other controls move."""
+    """Persistent output limits selected with a visible range slider."""
 
     stored_ranges = _stored_output_axis_ranges(bundle_path)
     default_range = _default_output_range(
@@ -531,68 +582,59 @@ def _output_axis_control(
         output,
         stored_ranges=stored_ranges,
     )
+    slider_bounds = _output_axis_slider_bounds(
+        bundle,
+        sample,
+        output,
+        default_range,
+    )
 
-    range_key = f"{context}__fixed_output_range__{output}"
-    min_widget_key = f"{context}__ymin__{output}"
-    max_widget_key = f"{context}__ymax__{output}"
-    default_key = f"{context}__axis_default__{output}"
+    slider_key = f"{context}__output_range_slider__{output}__v3"
+    signature_key = f"{context}__output_range_signature__{output}__v3"
+    signature = tuple(
+        round(float(value), 12)
+        for value in (*default_range, *slider_bounds)
+    )
 
-    normalized_default = tuple(round(float(x), 12) for x in default_range)
-    previous_default = st.session_state.get(default_key)
-
-    # Refresh stale full-range state when output_axis_ranges.csv first appears
-    # or is replaced. User edits remain persistent while the default is unchanged.
-    if previous_default != normalized_default:
-        st.session_state[default_key] = normalized_default
-        st.session_state[range_key] = tuple(map(float, default_range))
-        st.session_state[min_widget_key] = float(default_range[0])
-        st.session_state[max_widget_key] = float(default_range[1])
-    elif range_key not in st.session_state:
-        st.session_state[range_key] = tuple(map(float, default_range))
-
-    current_lo, current_hi = st.session_state[range_key]
-
-    if min_widget_key not in st.session_state:
-        st.session_state[min_widget_key] = float(current_lo)
-    if max_widget_key not in st.session_state:
-        st.session_state[max_widget_key] = float(current_hi)
-
-    with st.popover("Change y-axis"):
-        st.caption(
-            "These limits remain fixed when household states or model "
-            "parameters change."
-        )
-
-        lo = st.number_input(
-            "Minimum",
-            key=min_widget_key,
-            format="%.6g",
-        )
-        hi = st.number_input(
-            "Maximum",
-            key=max_widget_key,
-            format="%.6g",
-        )
-
-        if float(hi) <= float(lo):
-            st.error("The maximum must exceed the minimum.")
+    existing = st.session_state.get(slider_key)
+    valid_existing = False
+    if existing is not None:
+        try:
+            existing_lo, existing_hi = map(float, existing)
+        except (TypeError, ValueError):
+            valid_existing = False
         else:
-            st.session_state[range_key] = (float(lo), float(hi))
+            valid_existing = (
+                slider_bounds[0] <= existing_lo < existing_hi <= slider_bounds[1]
+            )
 
-        st.button(
-            "Reset to data range",
-            key=f"{context}__reset_y__{output}__v2",
-            width="stretch",
-            on_click=_reset_output_axis_state,
-            args=(
-                range_key,
-                min_widget_key,
-                max_widget_key,
-                default_range,
-            ),
-        )
+    if st.session_state.get(signature_key) != signature or not valid_existing:
+        st.session_state[signature_key] = signature
+        st.session_state.pop(slider_key, None)
 
-    return tuple(st.session_state[range_key])
+    label = (
+        f"{_pretty(output)} color-scale range"
+        if context == "two_dimensional"
+        else f"{_pretty(output)} y-axis range"
+    )
+    slider_arguments: dict[str, Any] = {}
+    if slider_key not in st.session_state:
+        slider_arguments["value"] = tuple(map(float, default_range))
+
+    selected = st.slider(
+        label,
+        min_value=float(slider_bounds[0]),
+        max_value=float(slider_bounds[1]),
+        step=max((slider_bounds[1] - slider_bounds[0]) / 500.0, 1.0e-10),
+        key=slider_key,
+        format="%.5g",
+        help=(
+            "Choose the displayed output interval. The selected interval remains "
+            "fixed when household states or model parameters change."
+        ),
+        **slider_arguments,
+    )
+    return float(selected[0]), float(selected[1])
 
 
 def _continuous_plot_columns(
@@ -869,45 +911,14 @@ def _continuous_control(
     )
 
 
-def _income_deviation_range(
-    bundle: SurrogateBundle,
-) -> tuple[float, float]:
-    """Return a stable range for current-income deviations from permanent income.
-
-    The public control is
-
-        current pre-tax income / permanent income - 1.
-
-    Thus zero means that current and permanent income are equal.  The range is
-    inferred from the fitted ``pre_tax_income_to_income`` feature but is always
-    constrained to keep permanent income positive.
-    """
-
-    info = bundle.feature_ranges.get("pre_tax_income_to_income", {})
-    ratio_lo = float(info.get("q01", info.get("min", 0.25)))
-    ratio_hi = float(info.get("q99", info.get("max", 1.75)))
-    if not np.isfinite(ratio_lo):
-        ratio_lo = 0.25
-    if not np.isfinite(ratio_hi):
-        ratio_hi = 1.75
-    lo = max(ratio_lo - 1.0, -0.95)
-    hi = max(ratio_hi - 1.0, lo + 0.05)
-    # The no-deviation state must always be available, even when it is just
-    # outside an empirical quantile range.
-    lo = min(lo, 0.0)
-    hi = max(hi, 0.0)
-    return float(lo), float(hi)
-
-
 def _sidebar_axis_bindings(
     axis_columns: set[str] | list[str] | tuple[str, ...],
 ) -> dict[str, str]:
     """Map plot axes to the primitive sidebar controls they determine.
 
-    Normalized asset axes determine the corresponding asset level conditional
-    on permanent income.  They therefore lock only the asset control; pre-tax
-    income remains adjustable and changes permanent income through the income-
-    deviation relationship.
+    A normalized asset axis controls the corresponding asset level.  Pre-tax
+    income remains the public income control; permanent income is inferred from
+    pre-tax income, age, employment, and the selected income-process parameters.
     """
 
     primitive_for_axis = {
@@ -925,12 +936,13 @@ def _sidebar_axis_bindings(
 def _exact_comparison_x_options(
     bundle: SurrogateBundle,
 ) -> list[str]:
+    """Public exact-grid axes; persistent income remains an internal state."""
+
     return [
         column
         for column in (
             "age",
             "current_income",
-            "labor_income_state",
             "liquid_assets",
             "liquid_slack_to_income",
             "illiquid_assets",
@@ -1130,37 +1142,8 @@ def _base_controls(
 
         if disabled:
             st.sidebar.caption(
-                f"{_pretty(col)} moves proportionally with current income."
+                f"{_pretty(col)} is determined by the other household-state controls."
             )
-
-    deviation_lo, deviation_hi = _income_deviation_range(bundle)
-    deviation_step = max((deviation_hi - deviation_lo) / 250.0, 1.0e-4)
-    deviation_key = "state_income_deviation_v1"
-    if deviation_key in st.session_state:
-        try:
-            stored_deviation = float(st.session_state[deviation_key])
-        except (TypeError, ValueError):
-            st.session_state.pop(deviation_key, None)
-        else:
-            if not deviation_lo <= stored_deviation <= deviation_hi:
-                st.session_state.pop(deviation_key, None)
-    base[INCOME_DEVIATION_COLUMN] = float(
-        st.sidebar.slider(
-            "Income Deviation",
-            min_value=float(deviation_lo),
-            max_value=float(deviation_hi),
-            value=0.0,
-            step=float(deviation_step),
-            key=deviation_key,
-            help=(
-                "Current pre-tax income divided by permanent income, minus one. "
-                "Zero means current pre-tax income equals permanent income."
-            ),
-        )
-    )
-    st.sidebar.caption(
-        "Permanent income is linked to Pre-Tax Income using this deviation."
-    )
 
     st.sidebar.header("Discrete household state")
     for col in bundle.feature_spec.categorical_state_columns:
@@ -1313,80 +1296,20 @@ def _link_income_states_to_pre_tax_income(
     base_values: dict[str, Any] | None = None,
     proportional_after_tax: bool = True,
 ) -> pd.DataFrame:
-    """Link permanent income to current pre-tax income and its deviation.
+    """Infer persistent income from the structural gross-income equation.
 
-    ``income_deviation`` is defined as current pre-tax income divided by
-    permanent income, minus one.  Holding it fixed while current income moves
-    gives
-
-        permanent income = current income / (1 + income_deviation).
-
-    For plotted income slices, disposable income can additionally move with the
-    selected baseline net-to-gross ratio.
+    ``proportional_after_tax`` is retained only for call compatibility.  The old
+    proportional after-tax override is intentionally removed; the bundle now
+    recomputes taxes and disposable income from the selected pre-tax income.
     """
 
-    out = frame.copy()
-    base = dict(base_values or {})
-    current = np.asarray(current_income_values, dtype=float)
-
-    current_info = bundle.feature_ranges.get("current_income", {})
-    anchor_current = float(
-        base.get(
-            "current_income",
-            bundle.default_values.get(
-                "current_income", current_info.get("median", 1.0)
-            ),
-        )
+    del proportional_after_tax
+    return _structural_income_link(
+        bundle,
+        frame,
+        np.asarray(current_income_values, dtype=float),
+        dict(base_values or {}),
     )
-    if not np.isfinite(anchor_current) or abs(anchor_current) <= 1.0e-12:
-        anchor_current = float(current_info.get("median", 1.0))
-    if not np.isfinite(anchor_current) or abs(anchor_current) <= 1.0e-12:
-        anchor_current = 1.0
-
-    if "labor_income_state" in bundle.feature_spec.state_columns:
-        labor_info = bundle.feature_ranges.get("labor_income_state", {})
-        anchor_labor = float(
-            base.get(
-                "labor_income_state",
-                bundle.default_values.get(
-                    "labor_income_state", labor_info.get("median", anchor_current)
-                ),
-            )
-        )
-        if not np.isfinite(anchor_labor):
-            anchor_labor = anchor_current
-
-        if INCOME_DEVIATION_COLUMN in out:
-            deviation = pd.to_numeric(
-                out[INCOME_DEVIATION_COLUMN], errors="coerce"
-            ).to_numpy(dtype=float)
-        elif INCOME_DEVIATION_COLUMN in base:
-            deviation = np.full(
-                len(out),
-                float(base[INCOME_DEVIATION_COLUMN]),
-                dtype=float,
-            )
-        else:
-            anchor_ratio = anchor_current / max(abs(anchor_labor), 1.0e-12)
-            deviation = np.full(len(out), anchor_ratio - 1.0, dtype=float)
-        deviation = np.where(np.isfinite(deviation), deviation, 0.0)
-        income_ratio = np.maximum(1.0 + deviation, 1.0e-6)
-        out["labor_income_state"] = current / income_ratio
-
-    if proportional_after_tax:
-        scale = current / anchor_current
-        anchor_after_tax = float(
-            base.get(
-                "after_tax_income",
-                bundle.default_values.get("after_tax_income", anchor_current),
-            )
-        )
-        if np.isfinite(anchor_after_tax):
-            out["__after_tax_income_override"] = np.maximum(
-                anchor_after_tax * scale, 0.0
-            )
-
-    return out
 
 
 def _line_slice(
@@ -1406,42 +1329,38 @@ def _line_slice(
     curve_values = overlay_values if overlay is not None else [None]
 
     for curve_value in curve_values:
-
         frame = pd.DataFrame([base] * n_points)
         label = "baseline"
 
-        # Set the primitive x-axis first. Derived ratios are translated below.
+        # Primitive axes and overlays are assigned first. Normalized asset axes
+        # are postponed until persistent income has been inferred row by row.
         if x not in DERIVED_ASSET_AXES:
-            frame = set_plot_axis(
-                frame,
-                x,
-                x_values,
-            )
+            frame = set_plot_axis(frame, x, x_values)
 
         if overlay is not None:
-            frame[overlay] = curve_value
+            if overlay not in DERIVED_ASSET_AXES:
+                frame[overlay] = curve_value
             label = f"{_pretty(overlay)} = {curve_value}"
 
-        if x == "current_income" or overlay == "current_income":
-            frame = _link_income_states_to_pre_tax_income(
-                bundle,
-                frame,
-                pd.to_numeric(frame["current_income"], errors="coerce").to_numpy(
-                    dtype=float
-                ),
-                base_values=base,
-            )
+        frame = _link_income_states_to_pre_tax_income(
+            bundle,
+            frame,
+            pd.to_numeric(frame["current_income"], errors="coerce").to_numpy(
+                dtype=float
+            ),
+            base_values=base,
+        )
 
-        # Translate the requested ratio into the corresponding asset level.
         if x in DERIVED_ASSET_AXES:
+            frame = set_plot_axis(frame, x, x_values)
+        if overlay in DERIVED_ASSET_AXES:
             frame = set_plot_axis(
                 frame,
-                x,
-                x_values,
+                str(overlay),
+                np.full(n_points, float(curve_value), dtype=float),
             )
 
         frame = complete_derived_state(frame)
-
         pred = bundle.predict(frame)
         liquid = pd.to_numeric(frame["liquid_assets"], errors="coerce").to_numpy(
             dtype=float
@@ -4983,6 +4902,7 @@ def _validation_page(
 def main() -> None:
     st.set_page_config(page_title="HA Policy Surrogate", layout="wide")
     args = _parse_args()
+    st.session_state.pop("state_income_deviation_v1", None)
     st.title("Smooth HA policy-function explorer")
     st.caption(
         "The page evaluates a fitted surrogate; it does not re-solve the HA model. "
@@ -5121,9 +5041,6 @@ def main() -> None:
             proportional_after_tax=False,
         )
     base_frame = bundle.prepare_inputs(base_frame)
-    # Preserve the public deviation control after the bundle has recomputed all
-    # model inputs; it is intentionally not a regression feature itself.
-    base_frame[INCOME_DEVIATION_COLUMN] = float(base.get(INCOME_DEVIATION_COLUMN, 0.0))
     base.update(base_frame.iloc[0].to_dict())
 
     if selected_page == "One-dimensional slices":
