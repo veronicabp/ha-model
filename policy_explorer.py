@@ -1,13 +1,20 @@
 """Streamlit explorer for smooth heterogeneous-agent policy functions.
 
-Run with:
+Run with either backend:
 
-    streamlit run policy_explorer.py -- --bundle OUTPUT/policy_surrogate.joblib
+    streamlit run policy_explorer.py -- \
+        --surrogate-type polynomial \
+        --bundle OUTPUT/policy_surrogate.joblib
+
+    streamlit run policy_explorer.py -- \
+        --surrogate-type neural \
+        --bundle OUTPUT/neural_policy_surrogate.pt
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,7 +25,20 @@ import plotly.graph_objects as go
 
 APP_ROOT = Path(__file__).resolve().parent
 APP_DATA_DIR = APP_ROOT / "app_data"
-DEFAULT_BUNDLE_PATH = APP_DATA_DIR / "policy_surrogate.joblib"
+
+DEFAULT_POLYNOMIAL_BUNDLE_PATH = APP_DATA_DIR / "policy_surrogate.joblib"
+DEFAULT_POLYNOMIAL_EVALUATION_BUNDLE_PATH = (
+    APP_DATA_DIR / "policy_surrogate_holdout.joblib"
+)
+DEFAULT_NEURAL_BUNDLE_PATH = APP_DATA_DIR / "neural_policy_surrogate.pt"
+DEFAULT_NEURAL_EVALUATION_BUNDLE_PATH = (
+    APP_DATA_DIR / "neural_policy_surrogate_holdout.pt"
+)
+
+SURROGATE_TYPE_LABELS = {
+    "polynomial": "Polynomial",
+    "neural": "Neural network",
+}
 
 try:
     import streamlit as st
@@ -28,20 +48,28 @@ except ImportError as exc:  # clearer error outside Streamlit
         "`pip install streamlit`."
     ) from exc
 
-from ha_policy_surrogate import (
-    PolicySurrogateBundle,
-    read_policy_dataset,
+from ha_policy_surrogate import read_policy_dataset
+from ha_surrogate_backend import (
+    SurrogateBundle,
+    WebsiteSurrogateBundle,
+    infer_surrogate_type,
+    load_surrogate_bundle,
+    normalize_surrogate_type,
 )
 from ha_policy_visualization import (
+    DERIVED_ASSET_AXES,
     complete_derived_state,
     load_exact_grid_slice,
     make_policy_surface,
+    set_plot_axis,
 )
 from ha_mpc_distribution import (
     ExactPolicyGrid,
     PopulationAssumptions,
     compute_check_mpcs,
     compute_exact_grid_check_mpcs,
+    align_population_to_exact_grid,
+    predict_exact_grid_consumption,
     generate_synthetic_population,
     infer_money_unit_info,
     load_exact_policy_grid,
@@ -57,6 +85,7 @@ POLICY_OUTPUTS = [
     "next_liquid_assets",
     "next_illiquid_assets",
 ]
+GRID_COMPARISON_OUTPUTS = POLICY_OUTPUTS + ["mpc"]
 
 SPECIAL_LABELS = {
     "consumption": "Consumption",
@@ -65,26 +94,144 @@ SPECIAL_LABELS = {
     "delta_illiquid_assets": "Change in Illiquid Assets (Illiquid Saving)",
     "next_liquid_assets": "Next Liquid Assets",
     "next_illiquid_assets": "Next Illiquid Assets",
+    "current_income": "Pre-Tax Income",
     "after_tax_income": "After-Tax Income",
+    "employment_state": "Employment",
     "param__policy__tax__kind": "Tax Schedule",
+    "illiquid_assets_to_income": "Illiquid Assets / Permanent Income",
+    "liquid_slack_to_income": "Liquid Slack / Permanent Income",
+    "mpc": "Marginal Propensity to Consume",
+    "income_deviation": "Income Deviation",
 }
+
+
+INCOME_DEVIATION_COLUMN = "income_deviation"
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
+        "--surrogate-type",
+        choices=("auto", "polynomial", "neural"),
+        default="neural",
+        help="Surrogate implementation used by the website.",
+    )
+    # Backward-compatible generic overrides. When omitted, the type-specific
+    # defaults below are used.
+    parser.add_argument(
         "--bundle",
         type=str,
-        default=str(DEFAULT_BUNDLE_PATH),
-        help="Path to the fitted policy-surrogate bundle.",
+        default=None,
+        help="Optional production-bundle override.",
+    )
+    parser.add_argument(
+        "--evaluation-bundle",
+        type=str,
+        default=None,
+        help="Optional true-holdout bundle override.",
+    )
+    parser.add_argument(
+        "--polynomial-bundle",
+        type=str,
+        default=str(DEFAULT_POLYNOMIAL_BUNDLE_PATH),
+    )
+    parser.add_argument(
+        "--polynomial-evaluation-bundle",
+        type=str,
+        default=str(DEFAULT_POLYNOMIAL_EVALUATION_BUNDLE_PATH),
+    )
+    parser.add_argument(
+        "--neural-bundle",
+        type=str,
+        default=str(DEFAULT_NEURAL_BUNDLE_PATH),
+    )
+    parser.add_argument(
+        "--neural-evaluation-bundle",
+        type=str,
+        default=str(DEFAULT_NEURAL_EVALUATION_BUNDLE_PATH),
+    )
+    parser.add_argument(
+        "--neural-device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Inference device for a neural surrogate.",
     )
     args, _ = parser.parse_known_args(sys.argv[1:])
     return args
 
 
+def _initial_surrogate_type(args: argparse.Namespace) -> str:
+    requested = normalize_surrogate_type(args.surrogate_type)
+    if requested != "auto":
+        return requested
+    if args.bundle:
+        try:
+            return infer_surrogate_type(args.bundle)
+        except ValueError:
+            pass
+    # Prefer the only deployed backend when exactly one default bundle exists;
+    # otherwise preserve the historical polynomial default.
+    polynomial_exists = Path(args.polynomial_bundle).expanduser().exists()
+    neural_exists = Path(args.neural_bundle).expanduser().exists()
+    if neural_exists and not polynomial_exists:
+        return "neural"
+    return "polynomial"
+
+
+def _default_bundle_path(args: argparse.Namespace, surrogate_type: str) -> str:
+    if args.bundle:
+        try:
+            if infer_surrogate_type(args.bundle) == surrogate_type:
+                return str(args.bundle)
+        except ValueError:
+            if normalize_surrogate_type(args.surrogate_type) == surrogate_type:
+                return str(args.bundle)
+    return str(
+        args.neural_bundle if surrogate_type == "neural" else args.polynomial_bundle
+    )
+
+
+def _default_evaluation_bundle_path(
+    args: argparse.Namespace,
+    surrogate_type: str,
+) -> str:
+    if args.evaluation_bundle:
+        try:
+            if infer_surrogate_type(args.evaluation_bundle) == surrogate_type:
+                return str(args.evaluation_bundle)
+        except ValueError:
+            if normalize_surrogate_type(args.surrogate_type) == surrogate_type:
+                return str(args.evaluation_bundle)
+    return str(
+        args.neural_evaluation_bundle
+        if surrogate_type == "neural"
+        else args.polynomial_evaluation_bundle
+    )
+
+
 @st.cache_resource(show_spinner=False)
-def _load_bundle(path: str) -> PolicySurrogateBundle:
-    return PolicySurrogateBundle.load(path)
+def _load_bundle(
+    path: str,
+    surrogate_type: str,
+    neural_device: str,
+) -> WebsiteSurrogateBundle:
+    return load_surrogate_bundle(
+        path,
+        surrogate_type=surrogate_type,
+        neural_device=neural_device,
+    )
+
+
+def _validate_evaluation_bundle(bundle: SurrogateBundle) -> None:
+    metadata = dict(bundle.training_metadata or {})
+    fit_ids = set(map(str, metadata.get("fit_models", [])))
+    test_ids = set(map(str, metadata.get("test_models", [])))
+    if metadata.get("fit_scope") != "development_only":
+        raise ValueError(
+            "The evaluation bundle was not fit on development models only."
+        )
+    if not test_ids or fit_ids & test_ids:
+        raise ValueError("The evaluation bundle does not contain a disjoint test set.")
 
 
 @st.cache_resource(show_spinner=False)
@@ -101,17 +248,35 @@ def _load_exact_policy_grid_cached(
 def _training_sample_path(bundle_path: str | Path) -> Path | None:
     """Return the sampled-policy file stored beside the fitted bundle."""
 
-    parent = Path(bundle_path).expanduser().resolve().parent
-    candidates = [
-        # Deployment should contain only the reduced held-out MPC-pair sample.
+    resolved = Path(bundle_path).expanduser().resolve()
+    parent = resolved.parent
+    deployment = [
         parent / "heldout_mpc_pairs.parquet",
         parent / "heldout_mpc_pairs.pkl.gz",
-        # Full-sample fallbacks are useful for local development only.
+    ]
+    polynomial = [
         parent / "policy_grid_sample.parquet",
         parent / "policy_grid_sample.pkl.gz",
         parent / "policy_grid_sample.pkl",
         parent / "policy_grid_sample.csv",
     ]
+    neural = [
+        parent / "neural_policy_grid_sample.parquet",
+        parent / "neural_policy_grid_sample.pkl.gz",
+        parent / "neural_policy_grid_sample.pkl",
+        parent / "neural_policy_grid_sample.csv",
+    ]
+    model_specific = (
+        neural + polynomial
+        if resolved.suffix.lower()
+        in {
+            ".pt",
+            ".pth",
+            ".ckpt",
+        }
+        else polynomial + neural
+    )
+    candidates = deployment + model_specific
     return next((path for path in candidates if path.exists()), None)
 
 
@@ -131,10 +296,7 @@ def _load_output_axis_ranges(
     """Load compact quantile-based output ranges saved beside the bundle."""
 
     del file_signature  # Used only to invalidate the cache when the file changes.
-    path = (
-        Path(bundle_path).expanduser().resolve().parent
-        / "output_axis_ranges.csv"
-    )
+    path = Path(bundle_path).expanduser().resolve().parent / "output_axis_ranges.csv"
     if not path.exists():
         return {}
 
@@ -155,22 +317,25 @@ def _load_output_axis_ranges(
 def _stored_output_axis_ranges(
     bundle_path: str | Path,
 ) -> dict[str, tuple[float, float]]:
-    path = (
-        Path(bundle_path).expanduser().resolve().parent
-        / "output_axis_ranges.csv"
-    )
+    path = Path(bundle_path).expanduser().resolve().parent / "output_axis_ranges.csv"
     signature = int(path.stat().st_mtime_ns) if path.exists() else None
     return _load_output_axis_ranges(str(bundle_path), signature)
 
 
 @st.cache_data(show_spinner=False)
 def _load_model_catalog(bundle_path: str) -> pd.DataFrame:
-    catalog_path = Path(bundle_path).expanduser().resolve().parent / "model_catalog.csv"
+    parent = Path(bundle_path).expanduser().resolve().parent
+    candidates = [
+        parent / "model_catalog.csv",
+        parent / "neural_model_catalog.csv",
+    ]
+    catalog_path = next((path for path in candidates if path.exists()), None)
 
-    if not catalog_path.exists():
+    if catalog_path is None:
+        names = ", ".join(path.name for path in candidates)
         raise FileNotFoundError(
-            f"Could not find {catalog_path}. The exact-grid tab "
-            "requires model_catalog.csv beside the surrogate bundle."
+            f"Could not find a model catalog beside the bundle. Expected one "
+            f"of: {names}."
         )
 
     catalog = pd.read_csv(catalog_path)
@@ -186,7 +351,7 @@ def _load_model_catalog(bundle_path: str) -> pd.DataFrame:
 
 
 def _out_of_sample_model_summary(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     catalog: pd.DataFrame,
 ) -> pd.DataFrame:
     """One row per held-out model with consumption and deposit R²."""
@@ -280,7 +445,7 @@ def _out_of_sample_model_summary(
 
 
 def _default_output_range(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     sample: pd.DataFrame,
     output: str,
     *,
@@ -290,7 +455,10 @@ def _default_output_range(
 
     stored_ranges = stored_ranges or {}
 
-    if output in stored_ranges:
+    if output == "mpc" and output not in stored_ranges:
+        lo, hi = -0.05, 1.05
+
+    elif output in stored_ranges:
         lo, hi = map(float, stored_ranges[output])
 
     elif not sample.empty and output in sample:
@@ -347,7 +515,7 @@ def _reset_output_axis_state(
 
 
 def _output_axis_control(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     sample: pd.DataFrame,
     output: str,
     *,
@@ -428,16 +596,37 @@ def _output_axis_control(
 
 
 def _continuous_plot_columns(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
 ) -> list[str]:
-    columns = list(bundle.feature_spec.state_columns) + [
-        column
-        for column in bundle.feature_spec.parameter_columns
-        if not column.endswith("__missing")
+    plot_engineered_columns = [
+        "liquid_slack_to_income",
+        "illiquid_assets_to_income",
     ]
 
+    columns = (
+        list(bundle.feature_spec.state_columns)
+        + [
+            column
+            for column in plot_engineered_columns
+            if (
+                column
+                in getattr(
+                    bundle.feature_spec,
+                    "engineered_state_columns",
+                    (),
+                )
+                and column in bundle.feature_ranges
+            )
+        ]
+        + [
+            column
+            for column in bundle.feature_spec.parameter_columns
+            if not column.endswith("__missing")
+        ]
+    )
     excluded = {
         "after_tax_income",
+        "labor_income_state",
         "total_assets",
         "cash_on_hand",
         "years_to_retirement",
@@ -452,14 +641,155 @@ def _continuous_plot_columns(
     preferred = [
         "current_income",
         "age",
-        "labor_income_state",
         "liquid_assets",
+        "liquid_slack_to_income",
         "illiquid_assets",
+        "illiquid_assets_to_income",
     ]
 
     return [column for column in preferred if column in columns] + [
         column for column in columns if column not in preferred
     ]
+
+
+def _retirement_age(
+    bundle: SurrogateBundle,
+    base: dict[str, Any] | pd.Series | None = None,
+) -> float:
+    """Return the retirement threshold used by the fitted HA accounting."""
+
+    values = {} if base is None else dict(base)
+    candidates = (
+        values.get("param__config__retirement_age"),
+        values.get("acct__retirement_age"),
+        bundle.default_values.get("param__config__retirement_age"),
+        bundle.default_values.get("acct__retirement_age"),
+        bundle.accounting_defaults.get("acct__retirement_age"),
+    )
+    for value in candidates:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number):
+            return number
+    return 65.0
+
+
+def _working_age_max(
+    bundle: SurrogateBundle,
+    base: dict[str, Any] | pd.Series | None = None,
+) -> float:
+    """Largest integer age that the solver treats as working age."""
+
+    return float(np.ceil(_retirement_age(bundle, base)) - 1.0)
+
+
+def _working_age_range_info(
+    bundle: SurrogateBundle,
+    info: dict[str, Any],
+    base: dict[str, Any] | pd.Series | None = None,
+) -> dict[str, Any]:
+    """Cap age-widget metadata at the working-age boundary."""
+
+    out = dict(info)
+    cap = _working_age_max(bundle, base)
+    for key in ("max", "q99"):
+        if key in out:
+            out[key] = min(float(out[key]), cap)
+    if "median" in out:
+        out["median"] = min(float(out["median"]), cap)
+    if "min" in out and float(out["min"]) > cap:
+        raise ValueError("The fitted bundle has no working-age support.")
+    return out
+
+
+def _employment_option_label(value: Any) -> str:
+    text = str(value).strip().lower()
+    if text in {"0", "0.0", "employed", "working", "true"}:
+        return "Employed"
+    return "Unemployed"
+
+
+def _borrowing_limit_values(
+    frame: pd.DataFrame,
+    *,
+    fallback: float = 0.0,
+) -> np.ndarray:
+    """Return the row-specific lower bound for liquid assets."""
+
+    for column in (
+        "param__config__borrowing_limit",
+        "liquid_grid_min",
+    ):
+        if column in frame:
+            values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+            return np.where(np.isfinite(values), values, float(fallback))
+    return np.full(len(frame), float(fallback), dtype=float)
+
+
+def _borrowing_limit_from_base(
+    bundle: SurrogateBundle,
+    base: dict[str, Any] | pd.Series,
+) -> float:
+    """Resolve the borrowing limit used by a one-dimensional plot."""
+
+    values = dict(base)
+    for column in (
+        "param__config__borrowing_limit",
+        "liquid_grid_min",
+    ):
+        value = values.get(column, bundle.default_values.get(column))
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number):
+            return number
+    return 0.0
+
+
+def _shade_liquid_infeasible_region(
+    fig: go.Figure,
+    *,
+    axis_variable: str,
+    axis_range: tuple[float, float],
+    bundle: SurrogateBundle,
+    base: dict[str, Any] | pd.Series,
+) -> None:
+    """Shade the part of a one-dimensional axis violating b >= borrowing limit."""
+
+    lo, hi = map(float, axis_range)
+    limit = _borrowing_limit_from_base(bundle, base)
+    if axis_variable == "liquid_assets" and lo < limit:
+        fig.add_vrect(
+            x0=lo,
+            x1=min(limit, hi),
+            fillcolor="#bdbdbd",
+            opacity=0.55,
+            line_width=0,
+            layer="below",
+            annotation_text="Infeasible",
+            annotation_position="top left",
+        )
+    elif axis_variable == "param__config__borrowing_limit":
+        liquid = float(
+            dict(base).get(
+                "liquid_assets",
+                bundle.default_values.get("liquid_assets", 0.0),
+            )
+        )
+        if hi > liquid:
+            fig.add_vrect(
+                x0=max(liquid, lo),
+                x1=hi,
+                fillcolor="#bdbdbd",
+                opacity=0.55,
+                line_width=0,
+                layer="below",
+                annotation_text="Infeasible",
+                annotation_position="top right",
+            )
 
 
 def _pretty(name: str) -> str:
@@ -539,14 +869,151 @@ def _continuous_control(
     )
 
 
+def _income_deviation_range(
+    bundle: SurrogateBundle,
+) -> tuple[float, float]:
+    """Return a stable range for current-income deviations from permanent income.
+
+    The public control is
+
+        current pre-tax income / permanent income - 1.
+
+    Thus zero means that current and permanent income are equal.  The range is
+    inferred from the fitted ``pre_tax_income_to_income`` feature but is always
+    constrained to keep permanent income positive.
+    """
+
+    info = bundle.feature_ranges.get("pre_tax_income_to_income", {})
+    ratio_lo = float(info.get("q01", info.get("min", 0.25)))
+    ratio_hi = float(info.get("q99", info.get("max", 1.75)))
+    if not np.isfinite(ratio_lo):
+        ratio_lo = 0.25
+    if not np.isfinite(ratio_hi):
+        ratio_hi = 1.75
+    lo = max(ratio_lo - 1.0, -0.95)
+    hi = max(ratio_hi - 1.0, lo + 0.05)
+    # The no-deviation state must always be available, even when it is just
+    # outside an empirical quantile range.
+    lo = min(lo, 0.0)
+    hi = max(hi, 0.0)
+    return float(lo), float(hi)
+
+
+def _sidebar_axis_bindings(
+    axis_columns: set[str] | list[str] | tuple[str, ...],
+) -> dict[str, str]:
+    """Map plot axes to the primitive sidebar controls they determine.
+
+    Normalized asset axes determine the corresponding asset level conditional
+    on permanent income.  They therefore lock only the asset control; pre-tax
+    income remains adjustable and changes permanent income through the income-
+    deviation relationship.
+    """
+
+    primitive_for_axis = {
+        "liquid_slack_to_income": "liquid_assets",
+        "illiquid_assets_to_income": "illiquid_assets",
+    }
+    bindings: dict[str, str] = {}
+    for axis in axis_columns:
+        if not axis:
+            continue
+        bindings[primitive_for_axis.get(axis, axis)] = axis
+    return bindings
+
+
+def _exact_comparison_x_options(
+    bundle: SurrogateBundle,
+) -> list[str]:
+    return [
+        column
+        for column in (
+            "age",
+            "current_income",
+            "labor_income_state",
+            "liquid_assets",
+            "liquid_slack_to_income",
+            "illiquid_assets",
+            "illiquid_assets_to_income",
+        )
+        if column in bundle.feature_ranges
+    ]
+
+
+def _page_axis_columns(
+    bundle: SurrogateBundle,
+    selected_page: str,
+) -> set[str]:
+    """Resolve the axes that should lock sidebar controls on this rerun."""
+
+    continuous = _continuous_plot_columns(bundle)
+    if not continuous:
+        return set()
+
+    default_x = "current_income" if "current_income" in continuous else continuous[0]
+
+    if selected_page == "One-dimensional slices":
+        x = str(st.session_state.get("one_d_x", default_x))
+        return {x if x in continuous else default_x}
+
+    if selected_page == "Two-dimensional surfaces":
+        x = str(st.session_state.get("surface_x", default_x))
+        if x not in continuous:
+            x = default_x
+        family = {
+            "liquid_assets": "liquid",
+            "liquid_slack_to_income": "liquid",
+            "illiquid_assets": "illiquid",
+            "illiquid_assets_to_income": "illiquid",
+        }
+        x_family = family.get(x)
+        y_options = [
+            column
+            for column in continuous
+            if column != x and (x_family is None or family.get(column) != x_family)
+        ]
+        if not y_options:
+            return {x}
+        default_y = "liquid_assets" if "liquid_assets" in y_options else y_options[0]
+        y = str(st.session_state.get("surface_y", default_y))
+        if y not in y_options:
+            y = default_y
+        return {x, y}
+
+    if selected_page == "Grid versus surrogate":
+        options = _exact_comparison_x_options(bundle)
+        if not options:
+            return set()
+        default = "current_income" if "current_income" in options else options[0]
+        x = str(st.session_state.get("exact_comparison_x", default))
+        return {x if x in options else default}
+
+    return set()
+
+
+def _reset_parameter_controls(bundle: SurrogateBundle) -> None:
+    """Reset every structural and policy parameter widget."""
+
+    for column in bundle.feature_spec.parameter_columns:
+        if column.endswith("__missing"):
+            continue
+        st.session_state.pop(f"param_{column}", None)
+    for column in bundle.feature_spec.categorical_parameter_columns:
+        st.session_state.pop(f"cat_param_v2_{column}", None)
+
+
 def _base_controls(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     *,
     excluded_columns: set[str] | None = None,
     disabled_state_columns: set[str] | None = None,
+    axis_controlled_by: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     excluded_columns = set(excluded_columns or ())
     disabled_state_columns = set(disabled_state_columns or ())
+    axis_controlled_by = dict(axis_controlled_by or {})
+    for column in excluded_columns:
+        axis_controlled_by.setdefault(column, column)
 
     base = dict(bundle.default_values)
     original_parameters = [
@@ -554,15 +1021,33 @@ def _base_controls(
     ]
 
     st.sidebar.header("Structural and policy parameters")
+    st.sidebar.button(
+        "Default Parameters",
+        on_click=_reset_parameter_controls,
+        args=(bundle,),
+        width="stretch",
+        help="Reset all structural and policy parameters to bundle defaults.",
+    )
     st.sidebar.caption(
         "Controls are restricted to values represented in the solved-model sample."
     )
     for col in original_parameters:
         info = bundle.feature_ranges[col]
 
-        if col in excluded_columns:
+        if col in axis_controlled_by:
             base[col] = bundle.default_values[col]
-            st.sidebar.caption(f"{_pretty(col)} is controlled by the plot axis.")
+            _continuous_control(
+                _pretty(col),
+                info,
+                float(base[col]),
+                key=f"axis_locked_param_{col}",
+                use_full_range=True,
+                disabled=True,
+            )
+            st.sidebar.caption(
+                f"{_pretty(col)} is controlled by the "
+                f"{_pretty(axis_controlled_by[col])} plot axis."
+            )
             continue
 
         base[col] = _continuous_control(
@@ -600,6 +1085,7 @@ def _base_controls(
 
     derived_or_recomputed = {
         "after_tax_income",
+        "labor_income_state",
         "total_assets",
         "cash_on_hand",
         "years_to_retirement",
@@ -609,12 +1095,28 @@ def _base_controls(
         if col in derived_or_recomputed:
             continue
 
-        if col in excluded_columns:
+        if col in axis_controlled_by:
             base[col] = bundle.default_values[col]
-            st.sidebar.caption(f"{_pretty(col)} is controlled by the plot axis.")
+            info = bundle.feature_ranges[col]
+            if col == "age":
+                info = _working_age_range_info(bundle, info, base)
+            _continuous_control(
+                _pretty(col),
+                info,
+                float(base[col]),
+                key=f"axis_locked_state_{col}",
+                use_full_range=False,
+                disabled=True,
+            )
+            st.sidebar.caption(
+                f"{_pretty(col)} is controlled by the "
+                f"{_pretty(axis_controlled_by[col])} plot axis."
+            )
             continue
 
         info = bundle.feature_ranges[col]
+        if col == "age":
+            info = _working_age_range_info(bundle, info, base)
         disabled = col in disabled_state_columns
 
         base[col] = _continuous_control(
@@ -631,28 +1133,90 @@ def _base_controls(
                 f"{_pretty(col)} moves proportionally with current income."
             )
 
+    deviation_lo, deviation_hi = _income_deviation_range(bundle)
+    deviation_step = max((deviation_hi - deviation_lo) / 250.0, 1.0e-4)
+    deviation_key = "state_income_deviation_v1"
+    if deviation_key in st.session_state:
+        try:
+            stored_deviation = float(st.session_state[deviation_key])
+        except (TypeError, ValueError):
+            st.session_state.pop(deviation_key, None)
+        else:
+            if not deviation_lo <= stored_deviation <= deviation_hi:
+                st.session_state.pop(deviation_key, None)
+    base[INCOME_DEVIATION_COLUMN] = float(
+        st.sidebar.slider(
+            "Income Deviation",
+            min_value=float(deviation_lo),
+            max_value=float(deviation_hi),
+            value=0.0,
+            step=float(deviation_step),
+            key=deviation_key,
+            help=(
+                "Current pre-tax income divided by permanent income, minus one. "
+                "Zero means current pre-tax income equals permanent income."
+            ),
+        )
+    )
+    st.sidebar.caption(
+        "Permanent income is linked to Pre-Tax Income using this deviation."
+    )
+
     st.sidebar.header("Discrete household state")
     for col in bundle.feature_spec.categorical_state_columns:
         if col == "is_retired":
+            # The website is intentionally restricted to working-age states.
+            values = list(bundle.feature_ranges.get(col, {}).get("values", []))
+            not_retired = next(
+                (
+                    value
+                    for value in values
+                    if str(value).strip().lower()
+                    in {"0", "0.0", "false", "working_age", "not_retired"}
+                ),
+                "0",
+            )
+            base[col] = not_retired
             continue
         info = bundle.feature_ranges[col]
         values = list(info.get("values", []))
         if not values:
             continue
         default_str = str(base.get(col, info.get("mode", values[0])))
+        if col == "employment_state":
+            employed_value = next(
+                (
+                    value
+                    for value in values
+                    if str(value).strip().lower() in {"0", "0.0", "employed", "true"}
+                ),
+                None,
+            )
+            if employed_value is not None:
+                default_str = str(employed_value)
         index = values.index(default_str) if default_str in values else 0
-        widget_key = f"cat_state_v2_{col}"
+        widget_key = f"cat_state_v4_{col}"
         if (
             widget_key in st.session_state
             and st.session_state[widget_key] not in values
         ):
             st.session_state.pop(widget_key, None)
-        base[col] = st.sidebar.selectbox(
-            _pretty(col),
-            values,
-            index=index,
-            key=widget_key,
-        )
+        if col == "employment_state":
+            base[col] = st.sidebar.radio(
+                "Employment",
+                values,
+                index=index,
+                key=widget_key,
+                format_func=_employment_option_label,
+                horizontal=True,
+            )
+        else:
+            base[col] = st.sidebar.selectbox(
+                _pretty(col),
+                values,
+                index=index,
+                key=widget_key,
+            )
 
     for col in (
         "liquid_grid_min",
@@ -666,86 +1230,167 @@ def _base_controls(
     return base
 
 
-def _range_selector(
-    bundle: PolicySurrogateBundle, col: str, key: str
-) -> tuple[float, float]:
+def _range_selector(bundle: SurrogateBundle, col: str, key: str) -> tuple[float, float]:
     info = bundle.feature_ranges[col]
+    if col == "age":
+        info = _working_age_range_info(bundle, info)
     lo = float(info.get("q01", info["min"]))
     hi = float(info.get("q99", info["max"]))
     if hi <= lo:
         return lo, hi
+    minimum = float(info["min"])
+    maximum = float(info["max"])
+    widget_key = f"{key}__{col}"
+    existing = st.session_state.get(widget_key)
+    if existing is not None:
+        try:
+            existing_lo, existing_hi = map(float, existing)
+        except (TypeError, ValueError):
+            st.session_state.pop(widget_key, None)
+        else:
+            if not (
+                minimum <= existing_lo <= existing_hi <= maximum
+                and existing_hi > existing_lo
+            ):
+                st.session_state.pop(widget_key, None)
     return st.slider(
         f"{_pretty(col)} range",
-        min_value=float(info["min"]),
-        max_value=float(info["max"]),
+        min_value=minimum,
+        max_value=maximum,
         value=(lo, hi),
-        step=max((float(info["max"]) - float(info["min"])) / 250.0, 1.0e-12),
-        key=key,
+        step=max((maximum - minimum) / 250.0, 1.0e-12),
+        key=widget_key,
     )
 
 
-def _link_labor_income_state_to_current_income(
-    bundle: PolicySurrogateBundle,
+def _exact_grid_range_selector(
+    exact_support: pd.DataFrame,
+    x: str,
+    *,
+    model_id: str,
+    key: str,
+) -> tuple[float, float]:
+    """Select a range whose endpoints are solved points for one exact model."""
+
+    values = (
+        pd.to_numeric(exact_support["__x"], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .unique()
+    )
+    values = np.sort(values.astype(float))
+    if len(values) == 0:
+        raise ValueError(
+            f"The selected exact model has no finite values for {_pretty(x)}."
+        )
+    if len(values) == 1:
+        value = float(values[0])
+        st.caption(
+            f"{_pretty(x)} has only one solved value in this slice: {value:.6g}."
+        )
+        return value, value
+
+    signature = hashlib.sha1(np.round(values, 12).tobytes()).hexdigest()[:12]
+    selected = st.select_slider(
+        f"{_pretty(x)} range",
+        options=values.tolist(),
+        value=(float(values[0]), float(values[-1])),
+        key=f"{key}__{model_id}__{x}__{signature}",
+        format_func=lambda value: f"{float(value):.6g}",
+        help=(
+            "The endpoints are restricted to values solved for the selected "
+            "exact model and fixed household states."
+        ),
+    )
+    return float(selected[0]), float(selected[1])
+
+
+def _link_income_states_to_pre_tax_income(
+    bundle: SurrogateBundle,
     frame: pd.DataFrame,
     current_income_values: np.ndarray,
+    *,
+    base_values: dict[str, Any] | None = None,
+    proportional_after_tax: bool = True,
 ) -> pd.DataFrame:
-    """Move labor-income state proportionally with current gross income.
+    """Link permanent income to current pre-tax income and its deviation.
 
-    The proportionality ratio is anchored to the bundle's baseline state,
-    rather than to the disabled sidebar slider.
+    ``income_deviation`` is defined as current pre-tax income divided by
+    permanent income, minus one.  Holding it fixed while current income moves
+    gives
+
+        permanent income = current income / (1 + income_deviation).
+
+    For plotted income slices, disposable income can additionally move with the
+    selected baseline net-to-gross ratio.
     """
 
     out = frame.copy()
+    base = dict(base_values or {})
+    current = np.asarray(current_income_values, dtype=float)
 
-    if "labor_income_state" not in bundle.feature_spec.state_columns:
-        return out
-
-    current_info = bundle.feature_ranges["current_income"]
-    labor_info = bundle.feature_ranges["labor_income_state"]
-
-    anchor_current_income = float(
-        bundle.default_values.get(
+    current_info = bundle.feature_ranges.get("current_income", {})
+    anchor_current = float(
+        base.get(
             "current_income",
-            current_info.get("median", 0.0),
+            bundle.default_values.get(
+                "current_income", current_info.get("median", 1.0)
+            ),
         )
     )
+    if not np.isfinite(anchor_current) or abs(anchor_current) <= 1.0e-12:
+        anchor_current = float(current_info.get("median", 1.0))
+    if not np.isfinite(anchor_current) or abs(anchor_current) <= 1.0e-12:
+        anchor_current = 1.0
 
-    anchor_labor_income = float(
-        bundle.default_values.get(
-            "labor_income_state",
-            labor_info.get("median", 0.0),
-        )
-    )
-
-    # Guard against a zero median caused by unemployed or retired observations.
-    if not np.isfinite(anchor_current_income) or abs(anchor_current_income) <= 1.0e-12:
-        anchor_current_income = float(
-            current_info.get(
-                "q99",
-                current_info.get("max", 1.0),
+    if "labor_income_state" in bundle.feature_spec.state_columns:
+        labor_info = bundle.feature_ranges.get("labor_income_state", {})
+        anchor_labor = float(
+            base.get(
+                "labor_income_state",
+                bundle.default_values.get(
+                    "labor_income_state", labor_info.get("median", anchor_current)
+                ),
             )
         )
+        if not np.isfinite(anchor_labor):
+            anchor_labor = anchor_current
 
-    if not np.isfinite(anchor_labor_income) or abs(anchor_labor_income) <= 1.0e-12:
-        anchor_labor_income = float(
-            labor_info.get(
-                "median",
-                labor_info.get("q99", 1.0),
+        if INCOME_DEVIATION_COLUMN in out:
+            deviation = pd.to_numeric(
+                out[INCOME_DEVIATION_COLUMN], errors="coerce"
+            ).to_numpy(dtype=float)
+        elif INCOME_DEVIATION_COLUMN in base:
+            deviation = np.full(
+                len(out),
+                float(base[INCOME_DEVIATION_COLUMN]),
+                dtype=float,
+            )
+        else:
+            anchor_ratio = anchor_current / max(abs(anchor_labor), 1.0e-12)
+            deviation = np.full(len(out), anchor_ratio - 1.0, dtype=float)
+        deviation = np.where(np.isfinite(deviation), deviation, 0.0)
+        income_ratio = np.maximum(1.0 + deviation, 1.0e-6)
+        out["labor_income_state"] = current / income_ratio
+
+    if proportional_after_tax:
+        scale = current / anchor_current
+        anchor_after_tax = float(
+            base.get(
+                "after_tax_income",
+                bundle.default_values.get("after_tax_income", anchor_current),
             )
         )
-
-    if abs(anchor_current_income) <= 1.0e-12:
-        ratio = 1.0
-    else:
-        ratio = anchor_labor_income / anchor_current_income
-
-    out["labor_income_state"] = np.asarray(current_income_values, dtype=float) * ratio
+        if np.isfinite(anchor_after_tax):
+            out["__after_tax_income_override"] = np.maximum(
+                anchor_after_tax * scale, 0.0
+            )
 
     return out
 
 
 def _line_slice(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     base: dict[str, Any],
     *,
     x: str,
@@ -753,7 +1398,6 @@ def _line_slice(
     overlay: str | None,
     overlay_values: list[Any],
     outputs: list[str],
-    linked_income: bool,
     y_range: tuple[float, float],
     n_points: int = 220,
 ) -> go.Figure:
@@ -762,25 +1406,64 @@ def _line_slice(
     curve_values = overlay_values if overlay is not None else [None]
 
     for curve_value in curve_values:
+
         frame = pd.DataFrame([base] * n_points)
-        frame[x] = x_values
         label = "baseline"
+
+        # Set the primitive x-axis first. Derived ratios are translated below.
+        if x not in DERIVED_ASSET_AXES:
+            frame = set_plot_axis(
+                frame,
+                x,
+                x_values,
+            )
+
         if overlay is not None:
             frame[overlay] = curve_value
             label = f"{_pretty(overlay)} = {curve_value}"
-        if linked_income and x == "current_income":
-            frame = _link_labor_income_state_to_current_income(
+
+        if x == "current_income" or overlay == "current_income":
+            frame = _link_income_states_to_pre_tax_income(
                 bundle,
                 frame,
+                pd.to_numeric(frame["current_income"], errors="coerce").to_numpy(
+                    dtype=float
+                ),
+                base_values=base,
+            )
+
+        # Translate the requested ratio into the corresponding asset level.
+        if x in DERIVED_ASSET_AXES:
+            frame = set_plot_axis(
+                frame,
+                x,
                 x_values,
             )
+
         frame = complete_derived_state(frame)
+
         pred = bundle.predict(frame)
+        liquid = pd.to_numeric(frame["liquid_assets"], errors="coerce").to_numpy(
+            dtype=float
+        )
+        borrowing_limit = _borrowing_limit_values(
+            frame,
+            fallback=_borrowing_limit_from_base(bundle, base),
+        )
+        feasible = (
+            np.isfinite(liquid)
+            & np.isfinite(borrowing_limit)
+            & (liquid >= borrowing_limit - 1.0e-12)
+        )
         for output in outputs:
+            plotted_values = pd.to_numeric(pred[output], errors="coerce").to_numpy(
+                dtype=float
+            )
+            plotted_values = np.where(feasible, plotted_values, np.nan)
             fig.add_trace(
                 go.Scatter(
                     x=x_values,
-                    y=pred[output],
+                    y=plotted_values,
                     mode="lines",
                     name=(
                         _pretty(output)
@@ -790,6 +1473,14 @@ def _line_slice(
                     legendgroup=label,
                 )
             )
+
+    _shade_liquid_infeasible_region(
+        fig,
+        axis_variable=x,
+        axis_range=x_range,
+        bundle=bundle,
+        base=base,
+    )
 
     fig.update_layout(
         template="plotly_white",
@@ -808,18 +1499,12 @@ def _line_slice(
 
 
 def _one_dimensional_page(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     base: dict[str, Any],
     *,
     bundle_path: str | Path,
 ) -> None:
     continuous = _continuous_plot_columns(bundle)
-
-    linked_columns = [
-        col
-        for col in ("labor_income_state",)
-        if col in bundle.feature_spec.state_columns
-    ]
 
     default_x = "current_income" if "current_income" in continuous else continuous[0]
 
@@ -850,21 +1535,10 @@ def _one_dimensional_page(
             key="one_d_output",
         )
     with c3:
-        linked_state_locked = x == "current_income" and bool(
-            st.session_state.get(
-                "one_d_linked_income",
-                bool(linked_columns),
-            )
-        )
-
         overlay_options: list[str | None] = [None] + [
             col
             for col in (continuous + list(bundle.feature_spec.categorical_columns))
-            if (
-                col != x
-                and col != "is_retired"
-                and not (linked_state_locked and col == "labor_income_state")
-            )
+            if col != x and col != "is_retired"
         ]
         overlay = st.selectbox(
             "Overlay several values of",
@@ -873,36 +1547,19 @@ def _one_dimensional_page(
         )
 
     x_range = _range_selector(bundle, x, "one_d_x_range")
-    linked_columns = [
-        col
-        for col in ("labor_income_state",)
-        if col in bundle.feature_spec.state_columns
-    ]
-
-    linked_label = (
-        "Move labor income state proportionally with current income"
-        if linked_columns
-        else "No labor-income state is included in this model"
-    )
-
-    linked_income_requested = st.checkbox(
-        linked_label,
-        value=bool(linked_columns),
-        disabled=(x != "current_income" or not linked_columns),
-        key="one_d_linked_income",
-    )
-
-    linked_income = bool(
-        linked_income_requested and x == "current_income" and linked_columns
-    )
     overlay_values: list[Any] = []
     if overlay is not None:
         info = bundle.feature_ranges[overlay]
+        if overlay == "age":
+            info = _working_age_range_info(bundle, info, base)
         if info["kind"] == "categorical":
             overlay_values = st.multiselect(
                 f"{_pretty(overlay)} values",
                 info["values"],
                 default=info["values"],
+                format_func=(
+                    _employment_option_label if overlay == "employment_state" else str
+                ),
             )
         else:
             lo, hi = float(info.get("q01", info["min"])), float(
@@ -944,7 +1601,6 @@ def _one_dimensional_page(
         overlay=overlay,
         overlay_values=overlay_values,
         outputs=[output],
-        linked_income=linked_income,
         y_range=y_range,
     )
     st.plotly_chart(fig, width="stretch")
@@ -961,23 +1617,9 @@ def _one_dimensional_page(
 
 
 def _surface_page(
-    bundle: PolicySurrogateBundle, base: dict[str, Any], *, bundle_path: str | Path
+    bundle: SurrogateBundle, base: dict[str, Any], *, bundle_path: str | Path
 ) -> None:
-    continuous = list(bundle.feature_spec.state_columns) + [
-        c for c in bundle.feature_spec.parameter_columns if not c.endswith("__missing")
-    ]
-    continuous = [
-        c
-        for c in continuous
-        if c in bundle.feature_ranges
-        and c
-        not in {
-            "after_tax_income",
-            "total_assets",
-            "cash_on_hand",
-            "years_to_retirement",
-        }
-    ]
+    continuous = _continuous_plot_columns(bundle)
     c1, c2, c3 = st.columns(3)
     with c1:
         x = st.selectbox(
@@ -991,11 +1633,31 @@ def _surface_page(
             format_func=_pretty,
             key="surface_x",
         )
-    y_options = [c for c in continuous if c != x]
+
+    axis_family = {
+        "liquid_assets": "liquid",
+        "liquid_slack_to_income": "liquid",
+        "illiquid_assets": "illiquid",
+        "illiquid_assets_to_income": "illiquid",
+    }
+
+    x_family = axis_family.get(x)
+
+    y_options = [
+        column
+        for column in continuous
+        if (column != x and (x_family is None or axis_family.get(column) != x_family))
+    ]
+
     with c2:
         y_default = (
             y_options.index("liquid_assets") if "liquid_assets" in y_options else 0
         )
+        if (
+            "surface_y" in st.session_state
+            and st.session_state["surface_y"] not in y_options
+        ):
+            st.session_state.pop("surface_y", None)
         y = st.selectbox(
             "Vertical axis",
             y_options,
@@ -1013,17 +1675,6 @@ def _surface_page(
 
     xr = _range_selector(bundle, x, "surface_x_range")
     yr = _range_selector(bundle, y, "surface_y_range")
-    linked_columns = [
-        col
-        for col in ("labor_income_state",)
-        if col in bundle.feature_spec.state_columns and col not in {x, y}
-    ]
-    linked_income = st.checkbox(
-        "Move other included income-state variables proportionally when current income varies",
-        value=bool(linked_columns),
-        disabled=("current_income" not in {x, y} or not linked_columns),
-        key="surface_linked_income",
-    )
     x_values = np.linspace(xr[0], xr[1], 65)
     y_values = np.linspace(yr[0], yr[1], 65)
     surface = make_policy_surface(
@@ -1033,9 +1684,28 @@ def _surface_page(
         x_values=x_values,
         y_values=y_values,
         base=base,
-        linked_income=linked_income,
+        linked_income=True,
     )
-    table = surface.pivot(index="__y", columns="__x", values=f"pred_{output}")
+
+    liquid = pd.to_numeric(surface["liquid_assets"], errors="coerce").to_numpy(
+        dtype=float
+    )
+    borrowing_limit = _borrowing_limit_values(
+        surface,
+        fallback=_borrowing_limit_from_base(bundle, base),
+    )
+    feasible = (
+        np.isfinite(liquid)
+        & np.isfinite(borrowing_limit)
+        & (liquid >= borrowing_limit - 1.0e-12)
+    )
+    value_column = f"pred_{output}"
+    surface[value_column] = np.where(
+        feasible,
+        pd.to_numeric(surface[value_column], errors="coerce").to_numpy(dtype=float),
+        np.nan,
+    )
+    table = surface.pivot(index="__y", columns="__x", values=value_column)
 
     # Avoid loading the full sampled grid merely to initialize the color scale.
     sample = pd.DataFrame()
@@ -1062,6 +1732,7 @@ def _surface_page(
         height=650,
         xaxis_title=_pretty(x),
         yaxis_title=_pretty(y),
+        plot_bgcolor=("#bdbdbd" if (~feasible).any() else "white"),
         margin=dict(l=40, r=20, t=30, b=40),
     )
     st.plotly_chart(fig, width="stretch")
@@ -1149,7 +1820,7 @@ def _mpc_histogram_figure(
 
 
 def _mpc_distribution_page(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     base: dict[str, Any],
     *,
     bundle_path: str | Path,
@@ -1439,7 +2110,7 @@ def _resolve_model_dir(
 
 
 def _model_base_from_catalog_row(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     base: dict[str, Any],
     selected_row: pd.Series,
 ) -> dict[str, Any]:
@@ -1481,7 +2152,7 @@ def _model_parameter_table(
 
 
 def _held_out_model_selector(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     *,
     bundle_path: str | Path,
     key_prefix: str,
@@ -1589,15 +2260,18 @@ def _held_out_model_selector(
 
 
 def _exact_grid_comparison_page(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     base: dict[str, Any],
     *,
     bundle_path: str | Path,
 ) -> None:
-    st.subheader("Held-out grid versus polynomial surrogate")
+    """Compare exact-grid slices with the development-only surrogate."""
+
+    st.subheader(f"Held-out grid versus {bundle.surrogate_label.lower()}")
     st.caption(
-        "Each model below was excluded when the evaluation surrogate was fitted. "
-        "The reported R² values are therefore out of sample."
+        f"The {bundle.short_surrogate_label.lower()} model on this page is the "
+        "development-only evaluation fit. Every selectable exact model is "
+        "therefore genuinely absent from its estimation sample."
     )
 
     selection = _held_out_model_selector(
@@ -1610,17 +2284,7 @@ def _exact_grid_comparison_page(
     _, selected_row, _, model_dir = selection
 
     c1, c2 = st.columns(2)
-    exact_x_options = [
-        column
-        for column in [
-            "age",
-            "current_income",
-            "labor_income_state",
-            "liquid_assets",
-            "illiquid_assets",
-        ]
-        if column in bundle.feature_ranges
-    ]
+    exact_x_options = _exact_comparison_x_options(bundle)
     with c1:
         x = st.selectbox(
             "Horizontal axis",
@@ -1636,40 +2300,105 @@ def _exact_grid_comparison_page(
     with c2:
         output = st.selectbox(
             "Policy choice",
-            POLICY_OUTPUTS,
+            GRID_COMPARISON_OUTPUTS,
             format_func=_pretty,
             key="exact_comparison_output",
         )
 
-    x_range = _range_selector(bundle, x, "exact_comparison_x_range")
-    # Exact-grid comparison uses bundle bounds for its initial y-axis range.
-    sample = pd.DataFrame()
-    y_range = _output_axis_control(
-        bundle,
-        sample,
-        output,
-        context="exact_comparison",
-        bundle_path=bundle_path,
-    )
+    mpc_check_units = 0.188679
+    if output == "mpc":
+        units_label = (
+            "model units"
+            if str(bundle.training_metadata.get("money_units", "model")) == "model"
+            else "data units"
+        )
+        mpc_check_units = float(
+            st.number_input(
+                f"Transfer used to calculate the MPC ({units_label})",
+                min_value=1.0e-6,
+                value=0.188679,
+                step=0.01,
+                format="%.6f",
+                key="exact_comparison_mpc_check_units",
+            )
+        )
+
     model_base = _model_base_from_catalog_row(bundle, base, selected_row)
     policy_layout = str(bundle.training_metadata.get("policy_layout", "GHKEBA"))
     money_units = str(bundle.training_metadata.get("money_units", "model"))
 
+    # Load the complete selected-model slice first. The range selector must be
+    # based on this model's solved support rather than the surrogate's global
+    # marginal support.
     try:
-        exact = load_exact_grid_slice(
+        exact_all = load_exact_grid_slice(
             model_dir,
             base=model_base,
             x=x,
-            x_range=x_range,
+            x_range=None,
             policy_layout=policy_layout,
             money_units=money_units,
         )
     except Exception as exc:
         st.error(f"Could not load the exact policy grid: {exc}")
         return
+    if exact_all.empty:
+        st.warning("The selected exact model has no solved points for this slice.")
+        return
+
+    exact_support = exact_all.copy()
+    if output == "mpc":
+        if not {"liquid_assets", "liquid_grid_max"}.issubset(exact_support.columns):
+            st.error(
+                "The exact slice does not contain liquid-grid bounds needed "
+                "to determine MPC feasibility."
+            )
+            return
+        liquid_assets = pd.to_numeric(exact_support["liquid_assets"], errors="coerce")
+        liquid_max = pd.to_numeric(exact_support["liquid_grid_max"], errors="coerce")
+        feasible = (
+            liquid_assets.notna()
+            & liquid_max.notna()
+            & (liquid_assets + float(mpc_check_units) <= liquid_max + 1.0e-12)
+        )
+        exact_support = exact_support.loc[feasible].copy()
+        if exact_support.empty:
+            st.warning(
+                "The transfer is too large for every point in this exact slice. "
+                "Reduce the MPC transfer or select a lower-liquid state."
+            )
+            return
+
+    selected_model_id = str(selected_row.get("model_id", model_dir.name))
+    try:
+        x_range = _exact_grid_range_selector(
+            exact_support,
+            x,
+            model_id=selected_model_id,
+            key="exact_comparison_x_range_v2",
+        )
+    except Exception as exc:
+        st.error(f"Could not construct the exact-support range selector: {exc}")
+        return
+
+    exact = exact_support.loc[
+        pd.to_numeric(exact_support["__x"], errors="coerce").between(
+            float(x_range[0]),
+            float(x_range[1]),
+        )
+    ].copy()
+    exact = exact.sort_values("__x").reset_index(drop=True)
     if exact.empty:
         st.warning("No exact grid points fall inside the selected x-axis range.")
         return
+
+    y_range = _output_axis_control(
+        bundle,
+        pd.DataFrame(),
+        output,
+        context="exact_comparison",
+        bundle_path=bundle_path,
+    )
 
     surrogate_input = pd.DataFrame([model_base] * len(exact))
     state_columns = set(
@@ -1688,15 +2417,80 @@ def _exact_grid_comparison_page(
     ]:
         if column in exact:
             surrogate_input[column] = exact[column].to_numpy()
-    surrogate = bundle.predict(surrogate_input)
+
+    if output == "mpc":
+        try:
+            exact_grid = _load_exact_policy_grid_cached(
+                str(model_dir),
+                policy_layout,
+            )
+            aligned = align_population_to_exact_grid(
+                exact_grid,
+                surrogate_input,
+                money_units=money_units,
+            )
+            exact_baseline, _ = predict_exact_grid_consumption(
+                exact_grid,
+                aligned,
+                liquid_asset_increment=0.0,
+                money_units=money_units,
+            )
+            exact_treated, treated_clipped = predict_exact_grid_consumption(
+                exact_grid,
+                aligned,
+                liquid_asset_increment=mpc_check_units,
+                money_units=money_units,
+            )
+            surrogate_baseline = bundle.predict(aligned)["consumption"].to_numpy(
+                dtype=float
+            )
+            treated_input = aligned.copy()
+            treated_input["liquid_assets"] = (
+                pd.to_numeric(treated_input["liquid_assets"], errors="coerce")
+                + mpc_check_units
+            )
+            surrogate_treated = bundle.predict(treated_input)["consumption"].to_numpy(
+                dtype=float
+            )
+
+            exact_values = (exact_treated - exact_baseline) / mpc_check_units
+            surrogate_values = (
+                surrogate_treated - surrogate_baseline
+            ) / mpc_check_units
+            valid = (
+                ~treated_clipped
+                & np.isfinite(exact_values)
+                & np.isfinite(surrogate_values)
+            )
+        except Exception as exc:
+            st.error(f"Could not calculate exact and surrogate MPCs: {exc}")
+            return
+    else:
+        surrogate = bundle.predict(surrogate_input)
+        exact_values = pd.to_numeric(exact[output], errors="coerce").to_numpy(
+            dtype=float
+        )
+        surrogate_values = pd.to_numeric(surrogate[output], errors="coerce").to_numpy(
+            dtype=float
+        )
+        valid = np.isfinite(exact_values) & np.isfinite(surrogate_values)
+
     comparison = pd.DataFrame(
         {
-            x: exact["__x"].to_numpy(),
-            "exact_grid": exact[output].to_numpy(),
-            "polynomial": surrogate[output].to_numpy(),
+            x: exact["__x"].to_numpy(dtype=float),
+            "exact_grid": exact_values,
+            "surrogate": surrogate_values,
+            "valid": valid,
         }
     )
-    comparison["error"] = comparison["polynomial"] - comparison["exact_grid"]
+    comparison = comparison.loc[comparison["valid"]].drop(columns="valid")
+    if comparison.empty:
+        st.warning(
+            "No feasible comparison points remain. For MPCs, reduce the transfer "
+            "so treated liquid wealth stays inside the exact grid."
+        )
+        return
+    comparison["error"] = comparison["surrogate"] - comparison["exact_grid"]
 
     fig = go.Figure()
     fig.add_trace(
@@ -1711,16 +2505,27 @@ def _exact_grid_comparison_page(
     fig.add_trace(
         go.Scatter(
             x=comparison[x],
-            y=comparison["polynomial"],
+            y=comparison["surrogate"],
             mode="lines",
-            name="Polynomial surrogate",
+            name=bundle.surrogate_label,
             line=dict(width=3),
         )
+    )
+    _shade_liquid_infeasible_region(
+        fig,
+        axis_variable=x,
+        axis_range=x_range,
+        bundle=bundle,
+        base=model_base,
     )
     fig.update_layout(
         template="plotly_white",
         height=620,
         xaxis_title=_pretty(x),
+        xaxis=dict(
+            range=[float(x_range[0]), float(x_range[1])],
+            autorange=False,
+        ),
         yaxis_title=_pretty(output),
         yaxis=dict(range=[float(y_range[0]), float(y_range[1])], autorange=False),
         hovermode="x unified",
@@ -1729,12 +2534,22 @@ def _exact_grid_comparison_page(
     )
     st.plotly_chart(fig, width="stretch")
 
-    rmse = float(np.sqrt(np.mean(comparison["error"] ** 2)))
-    max_error = float(comparison["error"].abs().max())
-    m1, m2, m3 = st.columns(3)
+    truth = comparison["exact_grid"].to_numpy(dtype=float)
+    predicted = comparison["surrogate"].to_numpy(dtype=float)
+    rmse = float(np.sqrt(np.mean((predicted - truth) ** 2)))
+    max_error = float(np.max(np.abs(predicted - truth)))
+    r2 = (
+        float(
+            1.0 - np.sum((predicted - truth) ** 2) / np.sum((truth - truth.mean()) ** 2)
+        )
+        if len(truth) > 1 and np.var(truth) > 1.0e-14
+        else np.nan
+    )
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Points compared", f"{len(comparison):,}")
-    m2.metric("Slice RMSE", f"{rmse:.6g}")
-    m3.metric("Maximum absolute error", f"{max_error:.6g}")
+    m2.metric("Slice R²", f"{r2:.4f}" if np.isfinite(r2) else "NA")
+    m3.metric("Slice RMSE", f"{rmse:.6g}")
+    m4.metric("Maximum absolute error", f"{max_error:.6g}")
     with st.expander("Comparison data"):
         st.dataframe(comparison, hide_index=True, width="stretch")
 
@@ -1744,51 +2559,61 @@ def _model_surrogate_mpc_histogram(
     surrogate_response: pd.DataFrame,
     *,
     check_amount_dollars: float,
+    surrogate_label: str,
     bins: int = 60,
 ) -> go.Figure:
+    """Overlapping, unsmoothed histograms using identical bins."""
+
     exact = pd.to_numeric(exact_response["mpc"], errors="coerce").to_numpy(dtype=float)
     surrogate = pd.to_numeric(surrogate_response["mpc"], errors="coerce").to_numpy(
         dtype=float
     )
+
     exact = exact[np.isfinite(exact)]
     surrogate = surrogate[np.isfinite(surrogate)]
+
     if not len(exact) or not len(surrogate):
         raise ValueError("No finite exact-model or surrogate MPCs are available.")
+
     pooled = np.concatenate([exact, surrogate])
     lo, hi = np.quantile(pooled, [0.005, 0.995])
     lo = min(float(lo), -0.05)
     hi = max(float(hi), 1.05)
+
     if hi <= lo + 1.0e-12:
         lo, hi = lo - 0.05, hi + 0.05
-    edges = np.linspace(lo, hi, int(bins) + 1)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    widths = np.diff(edges)
-    exact_density, _ = np.histogram(exact, bins=edges, density=True)
-    surrogate_density, _ = np.histogram(surrogate, bins=edges, density=True)
+
+    bin_size = (hi - lo) / int(bins)
+    shared_bins = dict(
+        start=lo,
+        end=hi,
+        size=bin_size,
+    )
 
     fig = go.Figure()
+
     fig.add_trace(
-        go.Bar(
-            x=centers,
-            y=exact_density,
-            width=widths,
+        go.Histogram(
+            x=exact,
+            xbins=shared_bins,
+            histnorm="probability density",
             name="Solved model",
-            opacity=0.65,
-            hovertemplate="MPC: %{x:.3f}<br>Exact density: %{y:.3f}<extra></extra>",
+            opacity=0.5,
+            hovertemplate=("MPC bin: %{x:.3f}<br>Density: %{y:.3f}<extra></extra>"),
         )
     )
+
     fig.add_trace(
-        go.Scatter(
-            x=centers,
-            y=surrogate_density,
-            mode="lines",
-            name="Polynomial surrogate",
-            line=dict(width=3),
-            hovertemplate=(
-                "MPC: %{x:.3f}<br>Surrogate density: %{y:.3f}<extra></extra>"
-            ),
+        go.Histogram(
+            x=surrogate,
+            xbins=shared_bins,
+            histnorm="probability density",
+            name=surrogate_label,
+            opacity=0.5,
+            hovertemplate=("MPC bin: %{x:.3f}<br>Density: %{y:.3f}<extra></extra>"),
         )
     )
+
     fig.add_vline(
         x=float(np.mean(exact)),
         line_dash="dash",
@@ -1801,16 +2626,18 @@ def _model_surrogate_mpc_histogram(
         annotation_text=f"Surrogate mean {np.mean(surrogate):.3f}",
         annotation_position="top right",
     )
+
     fig.update_layout(
         template="plotly_white",
         height=620,
         title=(
-            "Solved-model and polynomial MPC distributions for an unexpected "
+            "Solved-model and surrogate MPC distributions for an unexpected "
             f"${check_amount_dollars:,.0f} check"
         ),
         xaxis_title="Marginal propensity to consume",
         yaxis_title="Density",
         barmode="overlay",
+        bargap=0.02,
         legend_title="Policy source",
         margin=dict(l=45, r=20, t=75, b=45),
     )
@@ -1819,17 +2646,20 @@ def _model_surrogate_mpc_histogram(
 
 
 def _mpc_grid_comparison_page(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     base: dict[str, Any],
     *,
     bundle_path: str | Path,
 ) -> None:
-    st.subheader("Held-out model MPCs versus polynomial MPCs")
+    st.subheader(
+        f"Held-out model MPCs versus {bundle.short_surrogate_label.lower()} MPCs"
+    )
     st.caption(
-        "The exact model and polynomial are evaluated on the same synthetic "
-        "households. Ages, persistent-income states, employment states, and "
-        "groups are first mapped to the selected model's solved grid; liquid and "
-        "illiquid assets remain continuous and are interpolated."
+        f"The exact model and {bundle.short_surrogate_label.lower()} are evaluated "
+        "on the same synthetic households. Ages, persistent-income states, "
+        "employment states, and groups are first mapped to the selected model's "
+        "solved grid; liquid and illiquid assets remain continuous and are "
+        "interpolated."
     )
 
     selection = _held_out_model_selector(
@@ -2048,6 +2878,7 @@ def _mpc_grid_comparison_page(
         exact_response,
         surrogate_response,
         check_amount_dollars=float(check_amount),
+        surrogate_label=bundle.surrogate_label,
     )
     st.plotly_chart(fig, width="stretch")
 
@@ -2106,7 +2937,7 @@ def _mpc_grid_comparison_page(
         )
 
 
-def _held_out_model_ids(bundle: PolicySurrogateBundle) -> set[str]:
+def _held_out_model_ids(bundle: SurrogateBundle) -> set[str]:
     """Return the model IDs reserved for untouched validation."""
 
     for key in ("test_models", "validation_models"):
@@ -2127,19 +2958,15 @@ def _held_out_model_ids(bundle: PolicySurrogateBundle) -> set[str]:
 
 
 def _mpc_validation_columns(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     frame: pd.DataFrame,
 ) -> list[str]:
     """Continuous states and parameters suitable for the MPC binscatter."""
 
     preferred = [
         "age",
-        "years_to_terminal",
-        "years_since_retirement",
         "years_to_retirement_positive",
         "current_income",
-        "after_tax_income",
-        "labor_income_state",
         "liquid_assets",
         "illiquid_assets",
         "liquid_slack",
@@ -2164,6 +2991,13 @@ def _mpc_validation_columns(
         "grid_e",
         "grid_b",
         "grid_a",
+        "after_tax_income",
+        "labor_income_state",
+        "after_tax_income_to_income",
+        "pre_tax_income_to_income",
+        "is_retired",
+        "years_since_retirement",
+        "years_to_terminal",
     }
     out: list[str] = []
     for column in dict.fromkeys(preferred):
@@ -2189,7 +3023,7 @@ def _load_holdout_mpc_validation(
     # either file is replaced at the same path.
     del bundle_signature, sample_signature
 
-    bundle = PolicySurrogateBundle.load(bundle_path)
+    bundle = load_surrogate_bundle(bundle_path, surrogate_type="auto")
     sample = read_policy_dataset(sample_path)
 
     required = {
@@ -2454,7 +3288,7 @@ def _mpc_binscatter_table(
 
 
 def _validation_mpc_binscatter(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     *,
     bundle_path: str | Path,
 ) -> None:
@@ -2548,19 +3382,11 @@ def _validation_mpc_binscatter(
         )
 
     filtered = comparison.copy()
-    filter_columns = st.columns(2)
     if "is_retired" in filtered:
-        with filter_columns[0]:
-            retirement_filter = st.selectbox(
-                "Lifecycle group",
-                ["All", "Working age", "Retired"],
-                key="validation_mpc_retirement_filter",
-            )
-        retired = pd.to_numeric(filtered["is_retired"], errors="coerce").fillna(0)
-        if retirement_filter == "Working age":
-            filtered = filtered.loc[retired.eq(0)].copy()
-        elif retirement_filter == "Retired":
-            filtered = filtered.loc[retired.eq(1)].copy()
+        retired = pd.to_numeric(filtered["is_retired"], errors="coerce").fillna(1)
+        filtered = filtered.loc[retired.eq(0)].copy()
+    st.caption("Validation diagnostics are restricted to working-age households.")
+    filter_columns = st.columns(2)
 
     check_values = (
         pd.to_numeric(filtered["mpc_check_units"], errors="coerce")
@@ -2797,86 +3623,1360 @@ def _validation_mpc_binscatter(
         )
 
 
-def _validation_page(
-    bundle: PolicySurrogateBundle,
+def _load_dual_holdout_mpc_validation(
+    polynomial_bundle_path: str | Path,
+    neural_bundle_path: str | Path,
+) -> pd.DataFrame:
+    """Evaluate both holdout bundles on the same explicit MPC pairs."""
+
+    polynomial_path = Path(polynomial_bundle_path).expanduser().resolve()
+    neural_path = Path(neural_bundle_path).expanduser().resolve()
+
+    polynomial_sample = _training_sample_path(polynomial_path)
+    neural_sample = _training_sample_path(neural_path)
+
+    if polynomial_sample is None:
+        raise FileNotFoundError(
+            "No heldout_mpc_pairs or policy_grid_sample file was found beside "
+            "the polynomial holdout bundle."
+        )
+
+    if neural_sample is None:
+        raise FileNotFoundError(
+            "No heldout_mpc_pairs or policy_grid_sample file was found beside "
+            "the neural holdout bundle."
+        )
+
+    polynomial = _load_holdout_mpc_validation(
+        str(polynomial_path),
+        int(polynomial_path.stat().st_mtime_ns),
+        str(polynomial_sample.resolve()),
+        int(polynomial_sample.stat().st_mtime_ns),
+    ).rename(
+        columns={
+            "surrogate_mpc": "polynomial_mpc",
+        }
+    )
+
+    neural = _load_holdout_mpc_validation(
+        str(neural_path),
+        int(neural_path.stat().st_mtime_ns),
+        str(neural_sample.resolve()),
+        int(neural_sample.stat().st_mtime_ns),
+    )
+
+    keys = [
+        "model_id",
+        "mpc_pair_id",
+    ]
+
+    neural = neural[
+        keys
+        + [
+            "true_mpc",
+            "mpc_check_units",
+            "surrogate_mpc",
+        ]
+    ].rename(
+        columns={
+            "true_mpc": "neural_true_mpc",
+            "mpc_check_units": "neural_check_units",
+            "surrogate_mpc": "neural_mpc",
+        }
+    )
+
+    comparison = polynomial.merge(
+        neural,
+        on=keys,
+        how="inner",
+        validate="one_to_one",
+    )
+
+    if comparison.empty:
+        raise ValueError(
+            "The polynomial and neural bundles have no common held-out MPC pairs. "
+            "They must use the same model split and compatible pair files."
+        )
+
+    true_gap = (
+        pd.to_numeric(
+            comparison["true_mpc"],
+            errors="coerce",
+        )
+        - pd.to_numeric(
+            comparison["neural_true_mpc"],
+            errors="coerce",
+        )
+    ).abs()
+
+    check_gap = (
+        pd.to_numeric(
+            comparison["mpc_check_units"],
+            errors="coerce",
+        )
+        - pd.to_numeric(
+            comparison["neural_check_units"],
+            errors="coerce",
+        )
+    ).abs()
+
+    if true_gap.notna().any() and float(true_gap.max()) > 1.0e-8:
+        raise ValueError(
+            "The polynomial and neural pair files disagree on the true MPC "
+            "for at least one common model_id/mpc_pair_id."
+        )
+
+    if check_gap.notna().any() and float(check_gap.max()) > 1.0e-8:
+        raise ValueError(
+            "The polynomial and neural pair files disagree on the check size "
+            "for at least one common model_id/mpc_pair_id."
+        )
+
+    comparison = comparison.drop(
+        columns=[
+            "neural_true_mpc",
+            "neural_check_units",
+        ],
+        errors="ignore",
+    )
+
+    comparison["polynomial_error"] = (
+        comparison["polynomial_mpc"] - comparison["true_mpc"]
+    )
+
+    comparison["neural_error"] = comparison["neural_mpc"] - comparison["true_mpc"]
+
+    comparison["polynomial_squared_error"] = comparison["polynomial_error"] ** 2
+
+    comparison["neural_squared_error"] = comparison["neural_error"] ** 2
+
+    finite = np.ones(
+        len(comparison),
+        dtype=bool,
+    )
+
+    for column in (
+        "true_mpc",
+        "polynomial_mpc",
+        "neural_mpc",
+        "mpc_check_units",
+    ):
+        finite &= np.isfinite(
+            pd.to_numeric(
+                comparison[column],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+        )
+
+    finite &= (
+        pd.to_numeric(
+            comparison["mpc_check_units"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        > 0.0
+    )
+
+    comparison = comparison.loc[finite].reset_index(drop=True)
+
+    if comparison.empty:
+        raise ValueError("No finite common MPC pairs remain.")
+
+    return comparison
+
+
+def _dual_mpc_binscatter_table(
+    data: pd.DataFrame,
     *,
-    bundle_path: str | Path,
+    x: str,
+    n_bins: int,
+    trim_share: float,
+    equal_weight_models: bool,
+) -> pd.DataFrame:
+    """Bin truth and both surrogate MPCs using one common bin assignment."""
+
+    frame = data[
+        [
+            "model_id",
+            x,
+            "true_mpc",
+            "polynomial_mpc",
+            "neural_mpc",
+            "polynomial_error",
+            "neural_error",
+            "polynomial_squared_error",
+            "neural_squared_error",
+        ]
+    ].copy()
+
+    for column in frame.columns:
+        if column != "model_id":
+            frame[column] = pd.to_numeric(
+                frame[column],
+                errors="coerce",
+            )
+
+    frame = frame.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    ).dropna()
+
+    if frame.empty:
+        return pd.DataFrame()
+
+    if trim_share > 0.0 and frame[x].nunique(dropna=True) > int(n_bins):
+        lower, upper = frame[x].quantile(
+            [
+                trim_share,
+                1.0 - trim_share,
+            ]
+        )
+
+        frame = frame[
+            frame[x].between(
+                float(lower),
+                float(upper),
+            )
+        ].copy()
+
+    if frame.empty:
+        return pd.DataFrame()
+
+    unique_values = int(frame[x].nunique(dropna=True))
+
+    if unique_values <= int(n_bins):
+        frame["__bin"] = frame[x]
+    else:
+        frame["__bin"] = pd.qcut(
+            frame[x],
+            q=min(
+                int(n_bins),
+                unique_values,
+            ),
+            duplicates="drop",
+        )
+
+    if equal_weight_models:
+        model_bin = (
+            frame.groupby(
+                [
+                    "__bin",
+                    "model_id",
+                ],
+                observed=True,
+            )
+            .agg(
+                x=(x, "mean"),
+                true_mpc=("true_mpc", "mean"),
+                polynomial_mpc=("polynomial_mpc", "mean"),
+                neural_mpc=("neural_mpc", "mean"),
+                polynomial_error=("polynomial_error", "mean"),
+                neural_error=("neural_error", "mean"),
+                polynomial_mse=(
+                    "polynomial_squared_error",
+                    "mean",
+                ),
+                neural_mse=(
+                    "neural_squared_error",
+                    "mean",
+                ),
+                pairs=("true_mpc", "size"),
+            )
+            .reset_index()
+        )
+
+        bins = (
+            model_bin.groupby(
+                "__bin",
+                observed=True,
+            )
+            .agg(
+                x=("x", "mean"),
+                true_mpc=("true_mpc", "mean"),
+                polynomial_mpc=(
+                    "polynomial_mpc",
+                    "mean",
+                ),
+                neural_mpc=(
+                    "neural_mpc",
+                    "mean",
+                ),
+                polynomial_bias=(
+                    "polynomial_error",
+                    "mean",
+                ),
+                neural_bias=(
+                    "neural_error",
+                    "mean",
+                ),
+                polynomial_mse=(
+                    "polynomial_mse",
+                    "mean",
+                ),
+                neural_mse=(
+                    "neural_mse",
+                    "mean",
+                ),
+                models=(
+                    "model_id",
+                    "nunique",
+                ),
+                pairs=(
+                    "pairs",
+                    "sum",
+                ),
+            )
+            .reset_index(drop=True)
+        )
+
+    else:
+        bins = (
+            frame.groupby(
+                "__bin",
+                observed=True,
+            )
+            .agg(
+                x=(x, "mean"),
+                true_mpc=("true_mpc", "mean"),
+                polynomial_mpc=(
+                    "polynomial_mpc",
+                    "mean",
+                ),
+                neural_mpc=(
+                    "neural_mpc",
+                    "mean",
+                ),
+                polynomial_bias=(
+                    "polynomial_error",
+                    "mean",
+                ),
+                neural_bias=(
+                    "neural_error",
+                    "mean",
+                ),
+                polynomial_mse=(
+                    "polynomial_squared_error",
+                    "mean",
+                ),
+                neural_mse=(
+                    "neural_squared_error",
+                    "mean",
+                ),
+                models=(
+                    "model_id",
+                    "nunique",
+                ),
+                pairs=(
+                    "true_mpc",
+                    "size",
+                ),
+            )
+            .reset_index(drop=True)
+        )
+
+    bins["polynomial_rmse"] = np.sqrt(bins["polynomial_mse"])
+
+    bins["neural_rmse"] = np.sqrt(bins["neural_mse"])
+
+    return bins.sort_values(
+        "x",
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+
+def _validation_mpc_binscatter(
+    polynomial_bundle: SurrogateBundle,
+    neural_bundle: SurrogateBundle,
+    *,
+    polynomial_bundle_path: str | Path,
+    neural_bundle_path: str | Path,
 ) -> None:
+    """Show common-pair MPC diagnostics for truth and both surrogates."""
+
+    polynomial_color = "#1f77b4"
+    neural_color = "#ff7f0e"
+    truth_color = "#222222"
+
+    st.markdown("#### MPC binscatters on common held-out pairs")
+
+    st.caption(
+        "Truth, polynomial predictions, and neural-network predictions use "
+        "the same held-out model/pair observations and the same bins."
+    )
+
+    enabled = st.checkbox(
+        "Load household-level held-out MPC diagnostics",
+        value=False,
+        key="validation_enable_mpc_binscatter",
+        help=(
+            "This evaluates both holdout bundles on the explicit "
+            "baseline/treated MPC pairs."
+        ),
+    )
+
+    if not enabled:
+        return
+
+    try:
+        with st.spinner("Evaluating both surrogates on common MPC pairs..."):
+            comparison = _load_dual_holdout_mpc_validation(
+                polynomial_bundle_path,
+                neural_bundle_path,
+            )
+
+    except Exception as exc:
+        st.error("Could not construct dual-surrogate MPC diagnostics: " f"{exc}")
+        return
+
+    polynomial_columns = _mpc_validation_columns(
+        polynomial_bundle,
+        comparison,
+    )
+
+    neural_columns = set(
+        _mpc_validation_columns(
+            neural_bundle,
+            comparison,
+        )
+    )
+
+    x_columns = [column for column in polynomial_columns if column in neural_columns]
+
+    if not x_columns:
+        st.error("No common varying numeric state or parameter is available.")
+        return
+
+    default_x = "age" if "age" in x_columns else x_columns[0]
+
+    left, middle_1, middle_2, right = st.columns(
+        [
+            1.7,
+            1.0,
+            1.0,
+            1.2,
+        ]
+    )
+
+    with left:
+        x = st.selectbox(
+            "Horizontal axis",
+            x_columns,
+            index=x_columns.index(default_x),
+            format_func=_pretty,
+            key="validation_mpc_x",
+        )
+
+    with middle_1:
+        n_bins = st.slider(
+            "Number of bins",
+            min_value=5,
+            max_value=40,
+            value=20,
+            step=1,
+            key="validation_mpc_bins",
+        )
+
+    with middle_2:
+        trim_label = st.selectbox(
+            "Trim x-axis tails",
+            [
+                "None",
+                "0.1%",
+                "0.5%",
+                "1%",
+            ],
+            index=2,
+            key="validation_mpc_trim",
+        )
+
+        trim_share = {
+            "None": 0.0,
+            "0.1%": 0.001,
+            "0.5%": 0.005,
+            "1%": 0.01,
+        }[trim_label]
+
+    with right:
+        equal_weight_models = st.checkbox(
+            "Equal weight per model",
+            value=True,
+            key="validation_mpc_equal_model_weight",
+            help=(
+                "Average first within each model and bin, then average "
+                "equally across models."
+            ),
+        )
+
+    filtered = comparison.copy()
+
+    if "is_retired" in filtered:
+        retired = pd.to_numeric(
+            filtered["is_retired"],
+            errors="coerce",
+        ).fillna(1)
+
+        filtered = filtered.loc[retired.eq(0)].copy()
+
+    check_values = (
+        pd.to_numeric(
+            filtered["mpc_check_units"],
+            errors="coerce",
+        )
+        .replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        .dropna()
+    )
+
+    if len(check_values) and check_values.max() > check_values.min():
+        check_min = float(check_values.min())
+
+        check_max = float(check_values.max())
+
+        check_range = st.slider(
+            "Actual check size in bundle units",
+            min_value=check_min,
+            max_value=check_max,
+            value=(
+                check_min,
+                check_max,
+            ),
+            step=max(
+                (check_max - check_min) / 250.0,
+                1.0e-8,
+            ),
+            key="validation_mpc_check_range",
+        )
+
+        filtered = filtered[
+            pd.to_numeric(
+                filtered["mpc_check_units"],
+                errors="coerce",
+            ).between(
+                float(check_range[0]),
+                float(check_range[1]),
+            )
+        ].copy()
+
+    if filtered.empty:
+        st.warning("No common MPC pairs remain after filtering.")
+        return
+
+    bins = _dual_mpc_binscatter_table(
+        filtered,
+        x=x,
+        n_bins=int(n_bins),
+        trim_share=float(trim_share),
+        equal_weight_models=bool(equal_weight_models),
+    )
+
+    if bins.empty:
+        st.warning("The selected variable does not have enough finite observations.")
+        return
+
+    def metric_row(
+        label: str,
+        prediction_column: str,
+    ) -> dict[str, Any]:
+        true = pd.to_numeric(
+            filtered["true_mpc"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+
+        predicted = pd.to_numeric(
+            filtered[prediction_column],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+
+        finite = np.isfinite(true) & np.isfinite(predicted)
+
+        true = true[finite]
+        predicted = predicted[finite]
+
+        error = predicted - true
+
+        denominator = float(np.sum((true - np.mean(true)) ** 2))
+
+        r2 = (
+            float(1.0 - np.sum(error**2) / denominator) if denominator > 0.0 else np.nan
+        )
+
+        correlation = (
+            float(
+                np.corrcoef(
+                    true,
+                    predicted,
+                )[0, 1]
+            )
+            if (len(true) > 1 and np.std(true) > 0.0 and np.std(predicted) > 0.0)
+            else np.nan
+        )
+
+        return {
+            "Surrogate": label,
+            "Pairs": int(len(true)),
+            "MPC R²": r2,
+            "MPC correlation": correlation,
+            "MPC RMSE": (float(np.sqrt(np.mean(error**2))) if len(error) else np.nan),
+            "MPC bias": (float(np.mean(error)) if len(error) else np.nan),
+        }
+
+    metrics = pd.DataFrame(
+        [
+            metric_row(
+                "Polynomial",
+                "polynomial_mpc",
+            ),
+            metric_row(
+                "Neural network",
+                "neural_mpc",
+            ),
+        ]
+    )
+
+    st.dataframe(
+        metrics.style.format(
+            {
+                "MPC R²": "{:.4f}",
+                "MPC correlation": "{:.4f}",
+                "MPC RMSE": "{:.5f}",
+                "MPC bias": "{:+.5f}",
+            },
+            na_rep="—",
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+
+    st.caption(
+        f"Common pairs: {len(filtered):,}; "
+        f"common held-out models: "
+        f"{filtered['model_id'].nunique():,}."
+    )
+
+    mpc_figure = go.Figure()
+
+    mpc_figure.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["true_mpc"],
+            mode="lines+markers",
+            name="True MPC",
+            line=dict(
+                color=truth_color,
+                width=3,
+            ),
+            marker=dict(
+                color=truth_color,
+                size=7,
+            ),
+            hovertemplate=(
+                f"{_pretty(x)}: %{{x:.5g}}<br>" "True MPC: %{y:.4f}" "<extra></extra>"
+            ),
+        )
+    )
+
+    mpc_figure.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["polynomial_mpc"],
+            mode="lines+markers",
+            name="Polynomial",
+            line=dict(
+                color=polynomial_color,
+                width=2.5,
+            ),
+            marker=dict(
+                color=polynomial_color,
+                size=7,
+            ),
+            hovertemplate=(
+                f"{_pretty(x)}: %{{x:.5g}}<br>"
+                "Polynomial MPC: %{y:.4f}"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    mpc_figure.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["neural_mpc"],
+            mode="lines+markers",
+            name="Neural network",
+            line=dict(
+                color=neural_color,
+                width=2.5,
+            ),
+            marker=dict(
+                color=neural_color,
+                size=7,
+            ),
+            hovertemplate=(
+                f"{_pretty(x)}: %{{x:.5g}}<br>" "Neural MPC: %{y:.4f}" "<extra></extra>"
+            ),
+        )
+    )
+
+    mpc_figure.update_layout(
+        template="plotly_white",
+        height=580,
+        title=("Binned mean MPC: " "truth versus both surrogates"),
+        xaxis_title=_pretty(x),
+        yaxis_title=("Marginal propensity to consume"),
+        hovermode="x unified",
+        legend_title="Policy source",
+        margin=dict(
+            l=45,
+            r=20,
+            t=65,
+            b=45,
+        ),
+    )
+
+    st.plotly_chart(
+        mpc_figure,
+        width="stretch",
+    )
+
+    error_figure = go.Figure()
+
+    error_figure.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["polynomial_bias"],
+            mode="lines+markers",
+            name="Polynomial bias",
+            line=dict(
+                color=polynomial_color,
+                width=2.5,
+            ),
+            marker=dict(
+                color=polynomial_color,
+            ),
+        )
+    )
+
+    error_figure.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["neural_bias"],
+            mode="lines+markers",
+            name="Neural bias",
+            line=dict(
+                color=neural_color,
+                width=2.5,
+            ),
+            marker=dict(
+                color=neural_color,
+            ),
+        )
+    )
+
+    error_figure.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["polynomial_rmse"],
+            mode="lines+markers",
+            name="Polynomial RMSE",
+            line=dict(
+                color=polynomial_color,
+                width=2,
+                dash="dash",
+            ),
+            marker=dict(
+                color=polynomial_color,
+            ),
+        )
+    )
+
+    error_figure.add_trace(
+        go.Scatter(
+            x=bins["x"],
+            y=bins["neural_rmse"],
+            mode="lines+markers",
+            name="Neural RMSE",
+            line=dict(
+                color=neural_color,
+                width=2,
+                dash="dash",
+            ),
+            marker=dict(
+                color=neural_color,
+            ),
+        )
+    )
+
+    error_figure.add_hline(
+        y=0.0,
+        line_dash="dot",
+        line_color="#777777",
+    )
+
+    error_figure.update_layout(
+        template="plotly_white",
+        height=470,
+        title="Binned MPC error",
+        xaxis_title=_pretty(x),
+        yaxis_title="MPC error",
+        hovermode="x unified",
+        legend_title="Diagnostic",
+        margin=dict(
+            l=45,
+            r=20,
+            t=65,
+            b=45,
+        ),
+    )
+
+    st.plotly_chart(
+        error_figure,
+        width="stretch",
+    )
+
+    display = bins.rename(
+        columns={
+            "x": _pretty(x),
+            "true_mpc": "True MPC",
+            "polynomial_mpc": "Polynomial MPC",
+            "neural_mpc": "Neural MPC",
+            "polynomial_bias": "Polynomial bias",
+            "neural_bias": "Neural bias",
+            "polynomial_rmse": "Polynomial RMSE",
+            "neural_rmse": "Neural RMSE",
+            "pairs": "Pairs",
+            "models": "Models",
+        }
+    )
+
+    with st.expander(
+        "Binned MPC comparison data",
+        expanded=False,
+    ):
+        st.dataframe(
+            display,
+            hide_index=True,
+            width="stretch",
+        )
+
+        st.download_button(
+            "Download binned MPC comparison as CSV",
+            data=display.to_csv(index=False).encode("utf-8"),
+            file_name=("holdout_mpc_binscatter_" f"both_surrogates_{x}.csv"),
+            mime="text/csv",
+            key=("download_holdout_" "mpc_binscatter_both"),
+        )
+
+
+def _validation_page(
+    polynomial_bundle: SurrogateBundle,
+    neural_bundle: SurrogateBundle,
+    *,
+    polynomial_bundle_path: str | Path,
+    neural_bundle_path: str | Path,
+) -> None:
+    """Compare polynomial and neural holdout performance in one validation tab."""
+
+    polynomial_color = "#1f77b4"  # blue
+    neural_color = "#ff7f0e"  # orange
+
     st.subheader("Validation on entirely held-out parameterizations")
     st.caption(
-        "Consumption and deposit are fitted directly. Both asset levels and both "
-        "asset changes are reconstructed from the accounting equations. Asset "
-        "rows include persistence or zero-change benchmarks."
+        "Polynomial and neural results are shown on the same held-out metrics. "
+        "R² is reported only for fitted surrogates; reference rules, when "
+        "available, are displayed only as RMSE benchmarks."
     )
-    st.dataframe(bundle.validation_metrics, hide_index=True, width="stretch")
-    metrics = bundle.validation_metrics
-    fig = go.Figure()
-    fig.add_trace(
-        go.Bar(
-            x=metrics["target"].map(_pretty),
-            y=metrics["r2"],
-            name="Surrogate R-squared",
+
+    def _aggregate(
+        bundle: SurrogateBundle,
+        label: str,
+    ) -> pd.DataFrame:
+        frame = bundle.validation_metrics.copy()
+
+        required = {"target", "r2", "rmse"}
+        missing = required.difference(frame.columns)
+        if missing:
+            raise ValueError(
+                f"{label} validation metrics are missing columns: " f"{sorted(missing)}"
+            )
+
+        frame["target"] = frame["target"].astype(str)
+
+        for column in frame.columns:
+            if column != "target":
+                frame[column] = pd.to_numeric(
+                    frame[column],
+                    errors="coerce",
+                )
+
+        return frame.drop_duplicates("target", keep="first").reset_index(drop=True)
+
+    try:
+        polynomial = _aggregate(
+            polynomial_bundle,
+            "Polynomial",
+        )
+        neural = _aggregate(
+            neural_bundle,
+            "Neural",
+        )
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    # Preserve the target order in the validation files.
+    target_order = list(
+        dict.fromkeys(polynomial["target"].tolist() + neural["target"].tolist())
+    )
+    order_lookup = {target: position for position, target in enumerate(target_order)}
+
+    combined = polynomial.merge(
+        neural,
+        on="target",
+        how="outer",
+        suffixes=("_polynomial", "_neural"),
+        validate="one_to_one",
+    )
+    combined["__order"] = combined["target"].map(order_lookup)
+    combined = combined.sort_values("__order", kind="mergesort").reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # Aggregate table
+    # ------------------------------------------------------------------
+
+    table = pd.DataFrame(
+        {
+            "Policy choice": combined["target"].map(_pretty),
+            "Polynomial R²": pd.to_numeric(
+                combined["r2_polynomial"],
+                errors="coerce",
+            ),
+            "Neural R²": pd.to_numeric(
+                combined["r2_neural"],
+                errors="coerce",
+            ),
+            "Polynomial RMSE": pd.to_numeric(
+                combined["rmse_polynomial"],
+                errors="coerce",
+            ),
+            "Neural RMSE": pd.to_numeric(
+                combined["rmse_neural"],
+                errors="coerce",
+            ),
+        }
+    )
+
+    table["Neural − polynomial R²"] = table["Neural R²"] - table["Polynomial R²"]
+    table["Neural − polynomial RMSE"] = table["Neural RMSE"] - table["Polynomial RMSE"]
+
+    st.markdown("#### Aggregate holdout metrics")
+
+    styled_table = (
+        table.style.format(
+            {
+                "Polynomial R²": "{:.4f}",
+                "Neural R²": "{:.4f}",
+                "Polynomial RMSE": "{:.6g}",
+                "Neural RMSE": "{:.6g}",
+                "Neural − polynomial R²": "{:+.4f}",
+                "Neural − polynomial RMSE": "{:+.6g}",
+            },
+            na_rep="—",
+        )
+        .set_properties(
+            subset=[
+                "Polynomial R²",
+                "Polynomial RMSE",
+            ],
+            **{"background-color": "rgba(31,119,180,0.12)"},
+        )
+        .set_properties(
+            subset=[
+                "Neural R²",
+                "Neural RMSE",
+            ],
+            **{"background-color": "rgba(255,127,14,0.12)"},
         )
     )
-    if "benchmark_r2" in metrics:
-        benchmark = metrics[metrics["benchmark_r2"].notna()]
-        if not benchmark.empty:
-            fig.add_trace(
-                go.Bar(
-                    x=benchmark["target"].map(_pretty),
-                    y=benchmark["benchmark_r2"],
-                    name="Persistence / zero-change benchmark",
-                )
+
+    st.dataframe(
+        styled_table,
+        hide_index=True,
+        width="stretch",
+    )
+
+    # ------------------------------------------------------------------
+    # Aggregate R² plot
+    # ------------------------------------------------------------------
+
+    r2_data = table.dropna(
+        subset=[
+            "Polynomial R²",
+            "Neural R²",
+        ],
+        how="all",
+    )
+
+    if not r2_data.empty:
+        fig_r2 = go.Figure()
+
+        fig_r2.add_trace(
+            go.Bar(
+                x=r2_data["Policy choice"],
+                y=r2_data["Polynomial R²"],
+                name="Polynomial",
+                marker_color=polynomial_color,
+                hovertemplate=("%{x}<br>" "Polynomial R²: %{y:.4f}" "<extra></extra>"),
             )
-    fig.add_hline(y=0.0)
-    fig.update_layout(
+        )
+
+        fig_r2.add_trace(
+            go.Bar(
+                x=r2_data["Policy choice"],
+                y=r2_data["Neural R²"],
+                name="Neural network",
+                marker_color=neural_color,
+                hovertemplate=("%{x}<br>" "Neural R²: %{y:.4f}" "<extra></extra>"),
+            )
+        )
+
+        fig_r2.add_hline(
+            y=0.0,
+            line_dash="dash",
+            line_color="#777777",
+        )
+
+        fig_r2.update_layout(
+            template="plotly_white",
+            height=480,
+            title="Held-out R²",
+            xaxis_title="Policy choice",
+            yaxis_title="R²",
+            barmode="group",
+            legend_title="Surrogate",
+            margin=dict(
+                l=45,
+                r=20,
+                t=65,
+                b=45,
+            ),
+        )
+
+        st.plotly_chart(
+            fig_r2,
+            width="stretch",
+        )
+
+    # ------------------------------------------------------------------
+    # Aggregate RMSE plot
+    # ------------------------------------------------------------------
+
+    rmse_data = table.dropna(
+        subset=[
+            "Polynomial RMSE",
+            "Neural RMSE",
+        ],
+        how="all",
+    )
+
+    if not rmse_data.empty:
+        fig_rmse = go.Figure()
+
+        fig_rmse.add_trace(
+            go.Bar(
+                x=rmse_data["Policy choice"],
+                y=rmse_data["Polynomial RMSE"],
+                name="Polynomial",
+                marker_color=polynomial_color,
+                hovertemplate=(
+                    "%{x}<br>" "Polynomial RMSE: %{y:.6g}" "<extra></extra>"
+                ),
+            )
+        )
+
+        fig_rmse.add_trace(
+            go.Bar(
+                x=rmse_data["Policy choice"],
+                y=rmse_data["Neural RMSE"],
+                name="Neural network",
+                marker_color=neural_color,
+                hovertemplate=("%{x}<br>" "Neural RMSE: %{y:.6g}" "<extra></extra>"),
+            )
+        )
+
+        # Reference rules are common benchmarks, not fitted surrogates.
+        reference_specs = [
+            (
+                "reference_70_20_10_rmse",
+                "70/20/10 reference",
+                "#9e9e9e",
+            ),
+            (
+                "reference_consume_all_rmse",
+                "Consume-all reference",
+                "#c7c7c7",
+            ),
+        ]
+
+        for root, label, color in reference_specs:
+            polynomial_column = f"{root}_polynomial"
+            neural_column = f"{root}_neural"
+
+            if polynomial_column in combined.columns:
+                source_column = polynomial_column
+            elif neural_column in combined.columns:
+                source_column = neural_column
+            else:
+                continue
+
+            reference = pd.DataFrame(
+                {
+                    "Policy choice": combined["target"].map(_pretty),
+                    "RMSE": pd.to_numeric(
+                        combined[source_column],
+                        errors="coerce",
+                    ),
+                }
+            ).set_index("Policy choice")
+
+            values = rmse_data["Policy choice"].map(reference["RMSE"])
+
+            if values.notna().any():
+                fig_rmse.add_trace(
+                    go.Bar(
+                        x=rmse_data["Policy choice"],
+                        y=values,
+                        name=label,
+                        marker_color=color,
+                        opacity=0.75,
+                    )
+                )
+
+        fig_rmse.update_layout(
+            template="plotly_white",
+            height=480,
+            title="Held-out RMSE",
+            xaxis_title="Policy choice",
+            yaxis_title="RMSE",
+            barmode="group",
+            legend_title="Model or benchmark",
+            margin=dict(
+                l=45,
+                r=20,
+                t=65,
+                b=45,
+            ),
+        )
+
+        st.plotly_chart(
+            fig_rmse,
+            width="stretch",
+        )
+
+    # ------------------------------------------------------------------
+    # Model-level comparison
+    # ------------------------------------------------------------------
+
+    polynomial_models = polynomial_bundle.validation_by_model.copy()
+    neural_models = neural_bundle.validation_by_model.copy()
+
+    if polynomial_models.empty or neural_models.empty:
+        st.info(
+            "Model-level comparison requires both validation-by-model "
+            "tables. For the neural bundle, place "
+            "neural_validation_by_model.csv beside the holdout .pt file."
+        )
+        return
+
+    for frame in (
+        polynomial_models,
+        neural_models,
+    ):
+        frame["model_id"] = frame["model_id"].astype(str)
+        frame["target"] = frame["target"].astype(str)
+        frame["r2"] = pd.to_numeric(
+            frame["r2"],
+            errors="coerce",
+        )
+        frame["rmse"] = pd.to_numeric(
+            frame["rmse"],
+            errors="coerce",
+        )
+
+    polynomial_test_models = _held_out_model_ids(polynomial_bundle)
+    neural_test_models = _held_out_model_ids(neural_bundle)
+
+    if polynomial_test_models != neural_test_models:
+        st.warning(
+            "The polynomial and neural bundles do not contain exactly "
+            "the same held-out model IDs. The model-level table uses "
+            "the intersection where possible."
+        )
+
+    common_targets = sorted(
+        set(polynomial_models["target"]) & set(neural_models["target"])
+    )
+
+    if not common_targets:
+        st.info(
+            "The polynomial and neural model-level validation files "
+            "have no common policy targets."
+        )
+        return
+
+    st.markdown("#### Error distribution across held-out models")
+
+    chosen_target = st.selectbox(
+        "Policy choice",
+        common_targets,
+        format_func=_pretty,
+        key="validation_comparison_target",
+    )
+
+    polynomial_target = polynomial_models[
+        polynomial_models["target"] == chosen_target
+    ].copy()
+
+    neural_target = neural_models[neural_models["target"] == chosen_target].copy()
+
+    # ------------------------------------------------------------------
+    # Model-level RMSE box plot
+    # ------------------------------------------------------------------
+
+    fig_models = go.Figure()
+
+    fig_models.add_trace(
+        go.Box(
+            y=polynomial_target["rmse"],
+            name="Polynomial",
+            boxpoints="all",
+            marker_color=polynomial_color,
+            line_color=polynomial_color,
+            jitter=0.25,
+            hovertemplate=("Polynomial RMSE: %{y:.6g}" "<extra></extra>"),
+        )
+    )
+
+    fig_models.add_trace(
+        go.Box(
+            y=neural_target["rmse"],
+            name="Neural network",
+            boxpoints="all",
+            marker_color=neural_color,
+            line_color=neural_color,
+            jitter=0.25,
+            hovertemplate=("Neural RMSE: %{y:.6g}" "<extra></extra>"),
+        )
+    )
+
+    fig_models.update_layout(
         template="plotly_white",
-        height=450,
-        yaxis_title="R-squared",
-        xaxis_title="Policy choice",
-        barmode="group",
+        height=480,
+        title=("Held-out model RMSE: " f"{_pretty(chosen_target)}"),
+        xaxis_title="Surrogate",
+        yaxis_title="RMSE",
+        showlegend=False,
+        margin=dict(
+            l=45,
+            r=20,
+            t=65,
+            b=45,
+        ),
     )
-    st.plotly_chart(fig, width="stretch")
 
-    if "skill_vs_benchmark" in metrics:
-        skill = metrics[metrics["skill_vs_benchmark"].notna()]
-        if not skill.empty:
-            fig_skill = go.Figure(
-                go.Bar(
-                    x=skill["target"].map(_pretty),
-                    y=skill["skill_vs_benchmark"],
-                    name="Skill",
-                )
-            )
-            fig_skill.add_hline(y=0.0)
-            fig_skill.update_layout(
-                template="plotly_white",
-                height=390,
-                yaxis_title="1 - MSE / benchmark MSE",
-                xaxis_title="Policy choice",
-                title="Improvement over persistence or zero change",
-            )
-            st.plotly_chart(fig_skill, width="stretch")
+    st.plotly_chart(
+        fig_models,
+        width="stretch",
+    )
 
-    if not bundle.validation_by_model.empty:
-        st.subheader("Error distribution across held-out models")
-        chosen = st.selectbox(
-            "Policy choice",
-            sorted(bundle.validation_by_model["target"].unique()),
-            format_func=_pretty,
-            key="validation_target",
+    # ------------------------------------------------------------------
+    # Model-level table
+    # ------------------------------------------------------------------
+
+    model_table = (
+        polynomial_target[
+            [
+                "model_id",
+                "r2",
+                "rmse",
+            ]
+        ]
+        .rename(
+            columns={
+                "r2": "Polynomial R²",
+                "rmse": "Polynomial RMSE",
+            }
         )
-        d = bundle.validation_by_model[
-            bundle.validation_by_model["target"] == chosen
-        ].sort_values("rmse")
-        fig2 = go.Figure(go.Box(y=d["rmse"], boxpoints="all", name=_pretty(chosen)))
-        fig2.update_layout(template="plotly_white", height=430, yaxis_title="RMSE")
-        st.plotly_chart(fig2, width="stretch")
-        st.dataframe(d, hide_index=True, width="stretch")
+        .merge(
+            neural_target[
+                [
+                    "model_id",
+                    "r2",
+                    "rmse",
+                ]
+            ].rename(
+                columns={
+                    "r2": "Neural R²",
+                    "rmse": "Neural RMSE",
+                }
+            ),
+            on="model_id",
+            how="outer",
+            validate="one_to_one",
+        )
+    )
+
+    model_table["Neural − polynomial R²"] = (
+        model_table["Neural R²"] - model_table["Polynomial R²"]
+    )
+    model_table["Neural − polynomial RMSE"] = (
+        model_table["Neural RMSE"] - model_table["Polynomial RMSE"]
+    )
+
+    model_table = model_table.sort_values(
+        "Neural − polynomial RMSE",
+        kind="mergesort",
+    )
+
+    styled_models = (
+        model_table.style.format(
+            {
+                "Polynomial R²": "{:.4f}",
+                "Neural R²": "{:.4f}",
+                "Polynomial RMSE": "{:.6g}",
+                "Neural RMSE": "{:.6g}",
+                "Neural − polynomial R²": "{:+.4f}",
+                "Neural − polynomial RMSE": "{:+.6g}",
+            },
+            na_rep="—",
+        )
+        .set_properties(
+            subset=[
+                "Polynomial R²",
+                "Polynomial RMSE",
+            ],
+            **{"background-color": "rgba(31,119,180,0.12)"},
+        )
+        .set_properties(
+            subset=[
+                "Neural R²",
+                "Neural RMSE",
+            ],
+            **{"background-color": "rgba(255,127,14,0.12)"},
+        )
+    )
+
+    st.dataframe(
+        styled_models,
+        hide_index=True,
+        width="stretch",
+    )
 
     _validation_mpc_binscatter(
-        bundle,
-        bundle_path=bundle_path,
+        polynomial_bundle,
+        neural_bundle,
+        polynomial_bundle_path=polynomial_bundle_path,
+        neural_bundle_path=neural_bundle_path,
     )
 
 
@@ -2890,71 +4990,102 @@ def main() -> None:
         "parameters can still lie outside the joint support of solved models."
     )
 
-    bundle_path = st.sidebar.text_input("Surrogate bundle", value=str(args.bundle))
+    initial_type = _initial_surrogate_type(args)
+    surrogate_types = ["polynomial", "neural"]
+    surrogate_type = st.sidebar.selectbox(
+        "Surrogate type",
+        surrogate_types,
+        index=surrogate_types.index(initial_type),
+        format_func=lambda value: SURROGATE_TYPE_LABELS[value],
+        key="surrogate_type",
+    )
+
+    neural_device = str(args.neural_device)
+    if surrogate_type == "neural":
+        neural_device = st.sidebar.selectbox(
+            "Neural inference device",
+            ["auto", "cpu", "cuda"],
+            index=["auto", "cpu", "cuda"].index(str(args.neural_device)),
+            key="neural_inference_device",
+            help=(
+                "Auto uses CUDA when it is available and otherwise uses CPU. "
+                "CPU is generally sufficient for interactive slices."
+            ),
+        )
+
+    bundle_path = st.sidebar.text_input(
+        f"{SURROGATE_TYPE_LABELS[surrogate_type]} production bundle",
+        value=_default_bundle_path(args, surrogate_type),
+        key=f"production_bundle_path__{surrogate_type}",
+    )
     try:
-        bundle = _load_bundle(str(Path(bundle_path).expanduser()))
+        bundle = _load_bundle(
+            str(Path(bundle_path).expanduser()),
+            surrogate_type,
+            neural_device,
+        )
     except Exception as exc:
-        st.error(f"Could not load surrogate bundle: {exc}")
+        st.error(
+            f"Could not load the {SURROGATE_TYPE_LABELS[surrogate_type].lower()} "
+            f"production bundle: {exc}"
+        )
         st.stop()
+
+    if bundle.surrogate_type != surrogate_type:
+        st.error(
+            f"The selected type is {surrogate_type!r}, but the loaded bundle is "
+            f"{bundle.surrogate_type!r}."
+        )
+        st.stop()
+
+    default_evaluation_path = Path(
+        _default_evaluation_bundle_path(args, surrogate_type)
+    )
+    metadata_name = bundle.training_metadata.get("evaluation_bundle_filename")
+    if metadata_name:
+        default_evaluation_path = Path(bundle_path).expanduser().resolve().parent / str(
+            metadata_name
+        )
+    evaluation_bundle_path = st.sidebar.text_input(
+        f"{SURROGATE_TYPE_LABELS[surrogate_type]} true-holdout bundle",
+        value=str(default_evaluation_path),
+        key=f"evaluation_bundle_path__{surrogate_type}",
+    )
+    evaluation_bundle: SurrogateBundle | None = None
+    evaluation_error: str | None = None
+    try:
+        evaluation_bundle = _load_bundle(
+            str(Path(evaluation_bundle_path).expanduser()),
+            surrogate_type,
+            neural_device,
+        )
+        if evaluation_bundle.surrogate_type != surrogate_type:
+            raise ValueError(
+                "Production and evaluation bundles use different surrogate types."
+            )
+        _validate_evaluation_bundle(evaluation_bundle)
+    except Exception as exc:
+        evaluation_error = str(exc)
+
+    st.sidebar.caption(f"Loaded: {bundle.surrogate_label}")
+
     continuous_columns = _continuous_plot_columns(bundle)
 
     if not continuous_columns:
         st.error("The surrogate has no continuous plotting variables.")
         return
 
-    default_x = (
-        "current_income"
-        if "current_income" in continuous_columns
-        else continuous_columns[0]
-    )
-
-    current_x = st.session_state.get(
-        "one_d_x",
-        default_x,
-    )
-
-    if current_x not in continuous_columns:
-        st.session_state.pop("one_d_x", None)
-        current_x = default_x
-
-    # This must be defined before it is used below.
-    has_labor_income_state = "labor_income_state" in bundle.feature_spec.state_columns
-
-    linked_income_requested = bool(
-        st.session_state.get(
-            "one_d_linked_income",
-            has_labor_income_state,
-        )
-    )
-
-    linked_income_active = (
-        has_labor_income_state
-        and current_x == "current_income"
-        and linked_income_requested
-    )
-
-    disabled_state_columns = {"labor_income_state"} if linked_income_active else set()
-
-    base = _base_controls(
-        bundle,
-        excluded_columns={current_x},
-        disabled_state_columns=disabled_state_columns,
-    )
-    base_frame = bundle.prepare_inputs(pd.DataFrame([base]))
-    base.update(base_frame.iloc[0].to_dict())
-
     page_names = [
         "One-dimensional slices",
         "Two-dimensional surfaces",
         "MPC distribution",
-        "Grid versus polynomial",
-        "MPCs: grid versus polynomial",
+        "Grid versus surrogate",
+        "MPCs: grid versus surrogate",
         "Validation",
     ]
 
-    # Use an ordinary widget rather than dynamic tabs.  Only the selected page
-    # is executed, preserving the low-memory behavior without dynamic-tab
-    # widget-state churn across reruns.
+    # Use an ordinary widget rather than dynamic tabs. Only the selected page is
+    # executed, preserving the low-memory behavior across reruns.
     selected_page = st.radio(
         "Page",
         page_names,
@@ -2962,6 +5093,38 @@ def main() -> None:
         label_visibility="collapsed",
         key="main_page",
     )
+
+    # Exact-grid pages use the evaluation bundle's ranges, while ordinary pages
+    # use the production bundle.
+    axis_bundle = (
+        evaluation_bundle
+        if selected_page == "Grid versus surrogate" and evaluation_bundle is not None
+        else bundle
+    )
+    active_axes = _page_axis_columns(axis_bundle, selected_page)
+    axis_bindings = _sidebar_axis_bindings(active_axes)
+
+    base = _base_controls(
+        bundle,
+        disabled_state_columns=set(),
+        axis_controlled_by=axis_bindings,
+    )
+    base_frame = pd.DataFrame([base])
+    if "current_income" in base_frame:
+        base_frame = _link_income_states_to_pre_tax_income(
+            bundle,
+            base_frame,
+            pd.to_numeric(base_frame["current_income"], errors="coerce").to_numpy(
+                dtype=float
+            ),
+            base_values=base,
+            proportional_after_tax=False,
+        )
+    base_frame = bundle.prepare_inputs(base_frame)
+    # Preserve the public deviation control after the bundle has recomputed all
+    # model inputs; it is intentionally not a regression feature itself.
+    base_frame[INCOME_DEVIATION_COLUMN] = float(base.get(INCOME_DEVIATION_COLUMN, 0.0))
+    base.update(base_frame.iloc[0].to_dict())
 
     if selected_page == "One-dimensional slices":
         _one_dimensional_page(
@@ -2981,23 +5144,75 @@ def main() -> None:
             base,
             bundle_path=bundle_path,
         )
-    elif selected_page == "Grid versus polynomial":
-        _exact_grid_comparison_page(
-            bundle,
-            base,
-            bundle_path=bundle_path,
-        )
-    elif selected_page == "MPCs: grid versus polynomial":
-        _mpc_grid_comparison_page(
-            bundle,
-            base,
-            bundle_path=bundle_path,
-        )
-    else:
-        _validation_page(
-            bundle,
-            bundle_path=bundle_path,
-        )
+    elif selected_page in {
+        "Grid versus surrogate",
+        "MPCs: grid versus surrogate",
+        "Validation",
+    }:
+        if evaluation_bundle is None:
+            expected = (
+                "neural_policy_surrogate_holdout.pt"
+                if surrogate_type == "neural"
+                else "policy_surrogate_holdout.joblib"
+            )
+            st.error(
+                f"True-holdout pages require {expected}. "
+                f"Could not load it: {evaluation_error}"
+            )
+            return
+        if selected_page == "Grid versus surrogate":
+            _exact_grid_comparison_page(
+                evaluation_bundle,
+                base,
+                bundle_path=evaluation_bundle_path,
+            )
+        elif selected_page == "MPCs: grid versus surrogate":
+            _mpc_grid_comparison_page(
+                evaluation_bundle,
+                base,
+                bundle_path=evaluation_bundle_path,
+            )
+        else:
+            polynomial_validation_path = st.sidebar.text_input(
+                "Polynomial true-holdout bundle",
+                value=str(args.polynomial_evaluation_bundle),
+                key="validation_polynomial_bundle_path",
+            )
+
+            neural_validation_path = st.sidebar.text_input(
+                "Neural true-holdout bundle",
+                value=str(args.neural_evaluation_bundle),
+                key="validation_neural_bundle_path",
+            )
+
+            try:
+                polynomial_validation_bundle = _load_bundle(
+                    str(Path(polynomial_validation_path).expanduser()),
+                    "polynomial",
+                    "cpu",
+                )
+                _validate_evaluation_bundle(polynomial_validation_bundle)
+            except Exception as exc:
+                st.error("Could not load the polynomial holdout bundle: " f"{exc}")
+                return
+
+            try:
+                neural_validation_bundle = _load_bundle(
+                    str(Path(neural_validation_path).expanduser()),
+                    "neural",
+                    neural_device,
+                )
+                _validate_evaluation_bundle(neural_validation_bundle)
+            except Exception as exc:
+                st.error("Could not load the neural holdout bundle: " f"{exc}")
+                return
+
+            _validation_page(
+                polynomial_validation_bundle,
+                neural_validation_bundle,
+                polynomial_bundle_path=polynomial_validation_path,
+                neural_bundle_path=neural_validation_path,
+            )
 
 
 if __name__ == "__main__":

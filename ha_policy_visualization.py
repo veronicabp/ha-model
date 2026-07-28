@@ -11,6 +11,94 @@ import json
 
 from ha_policy_surrogate import PolicySurrogateBundle
 
+DERIVED_ASSET_AXES = {
+    "liquid_slack_to_income",
+    "illiquid_assets_to_income",
+}
+
+
+def set_plot_axis(
+    frame: pd.DataFrame,
+    variable: str,
+    values: Sequence[float] | np.ndarray,
+) -> pd.DataFrame:
+    """Set a plot axis, translating derived asset ratios into primitive states.
+
+    liquid_slack_to_income = (liquid_assets - borrowing_limit) / permanent_income
+    illiquid_assets_to_income = illiquid_assets / permanent_income
+    """
+
+    out = frame.copy()
+    values_array = np.asarray(values, dtype=float)
+
+    if values_array.ndim == 0:
+        values_array = np.full(len(out), float(values_array))
+
+    if len(values_array) != len(out):
+        raise ValueError(
+            f"Axis {variable!r} has {len(values_array)} values "
+            f"for a frame with {len(out)} rows."
+        )
+
+    if variable not in DERIVED_ASSET_AXES:
+        out[variable] = values_array
+        return out
+
+    if "labor_income_state" not in out:
+        raise ValueError(
+            f"{variable!r} requires labor_income_state to recover asset levels."
+        )
+
+    permanent_income = pd.to_numeric(
+        out["labor_income_state"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    finite_income = np.abs(permanent_income[np.isfinite(permanent_income)])
+    typical_income = float(np.median(finite_income)) if len(finite_income) else 1.0
+    income_floor = max(1.0e-6, 1.0e-3 * typical_income)
+
+    income_scale = np.maximum(
+        np.abs(permanent_income),
+        income_floor,
+    )
+
+    if variable == "liquid_slack_to_income":
+        if "param__config__borrowing_limit" in out:
+            borrowing_limit = pd.to_numeric(
+                out["param__config__borrowing_limit"],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+        elif "liquid_grid_min" in out:
+            borrowing_limit = pd.to_numeric(
+                out["liquid_grid_min"],
+                errors="coerce",
+            ).to_numpy(dtype=float)
+        else:
+            borrowing_limit = np.zeros(len(out), dtype=float)
+
+        borrowing_limit = np.where(
+            np.isfinite(borrowing_limit),
+            borrowing_limit,
+            0.0,
+        )
+
+        out["liquid_assets"] = borrowing_limit + values_array * income_scale
+        out["liquid_slack_to_income"] = values_array
+
+    elif variable == "illiquid_assets_to_income":
+        out["illiquid_assets"] = values_array * income_scale
+        out["illiquid_assets_to_income"] = values_array
+
+    elif variable == "cash_on_hand":
+        out["cash_on_hand"] = values_array
+        out["liquid_assets"] = values_array - pd.to_numeric(
+            out.get("after_tax_income", 0.0),
+            errors="coerce",
+        ).to_numpy(dtype=float)
+
+    return out
+
 
 def link_labor_income_state(
     bundle: PolicySurrogateBundle,
@@ -18,42 +106,51 @@ def link_labor_income_state(
     varied_income: np.ndarray,
     base: Mapping[str, Any],
 ) -> pd.DataFrame:
-    """Move the latent labor-income state proportionally with current income.
+    """Link hidden income variables to the public pre-tax-income control.
 
-    The proportionality anchor deliberately does not use the sidebar value of
-    current_income. That value is irrelevant when current_income itself is the
-    plotting axis.
+    The latent permanent-income state and disposable income move in the same
+    proportion as pre-tax income. The latter is passed through an internal
+    override that ``PolicySurrogateBundle.prepare_inputs`` recognizes.
     """
 
     out = frame.copy()
-
-    if "labor_income_state" not in bundle.feature_spec.state_columns:
-        return out
-
+    current = np.asarray(varied_income, dtype=float)
     anchor_income = float(
-        bundle.default_values.get(
+        base.get(
             "current_income",
-            bundle.feature_ranges["current_income"].get("median", 1.0),
+            bundle.default_values.get(
+                "current_income",
+                bundle.feature_ranges["current_income"].get("median", 1.0),
+            ),
         )
     )
-
     if not np.isfinite(anchor_income) or abs(anchor_income) <= 1.0e-12:
         anchor_income = float(
             bundle.feature_ranges["current_income"].get("median", 1.0)
         )
-
     if not np.isfinite(anchor_income) or abs(anchor_income) <= 1.0e-12:
-        return out
+        anchor_income = 1.0
+    scale = current / anchor_income
 
-    anchor_labor_state = float(
+    if "labor_income_state" in bundle.feature_spec.state_columns:
+        anchor_labor_state = float(
+            base.get(
+                "labor_income_state",
+                bundle.default_values.get("labor_income_state", anchor_income),
+            )
+        )
+        if not np.isfinite(anchor_labor_state):
+            anchor_labor_state = anchor_income
+        out["labor_income_state"] = anchor_labor_state * scale
+
+    anchor_after_tax = float(
         base.get(
-            "labor_income_state",
-            bundle.default_values.get("labor_income_state", anchor_income),
+            "after_tax_income",
+            bundle.default_values.get("after_tax_income", anchor_income),
         )
     )
-
-    ratio = anchor_labor_state / anchor_income
-    out["labor_income_state"] = np.asarray(varied_income, dtype=float) * ratio
+    if np.isfinite(anchor_after_tax):
+        out["__after_tax_income_override"] = np.maximum(anchor_after_tax * scale, 0.0)
 
     return out
 
@@ -232,13 +329,13 @@ def load_exact_grid_slice(
         b = np.full(K, b0)
         a = np.full(K, a0)
 
-    elif x == "liquid_assets":
+    elif x in {"liquid_assets", "liquid_slack_to_income"}:
         b = np.arange(B)
         h = np.full(B, h0)
         k = np.full(B, k0)
         a = np.full(B, a0)
 
-    elif x == "illiquid_assets":
+    elif x in {"illiquid_assets", "illiquid_assets_to_income"}:
         a = np.arange(A)
         h = np.full(A, h0)
         k = np.full(A, k0)
@@ -370,6 +467,19 @@ def load_exact_grid_slice(
         }
     )
 
+    income_scale = np.maximum(
+        np.abs(frame["labor_income_state"].to_numpy(dtype=float)),
+        1.0e-8,
+    )
+
+    frame["liquid_slack_to_income"] = (
+        frame["liquid_assets"].to_numpy(dtype=float) - float(liquid_grid[0])
+    ) / income_scale
+
+    frame["illiquid_assets_to_income"] = (
+        frame["illiquid_assets"].to_numpy(dtype=float) / income_scale
+    )
+
     frame["__x"] = frame[x]
 
     if x_range is not None:
@@ -379,18 +489,83 @@ def load_exact_grid_slice(
     return frame.sort_values("__x").reset_index(drop=True)
 
 
-def complete_derived_state(frame: pd.DataFrame) -> pd.DataFrame:
-    """Recompute deterministic state features after changing a primitive state."""
+def complete_derived_state(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Recompute deterministic state features after changing primitive states."""
 
     out = frame.copy()
-    if {"liquid_assets", "illiquid_assets"}.issubset(out.columns):
-        out["total_assets"] = pd.to_numeric(
-            out["liquid_assets"], errors="coerce"
-        ) + pd.to_numeric(out["illiquid_assets"], errors="coerce")
-    if {"liquid_assets", "after_tax_income"}.issubset(out.columns):
-        out["cash_on_hand"] = pd.to_numeric(
-            out["liquid_assets"], errors="coerce"
-        ) + pd.to_numeric(out["after_tax_income"], errors="coerce")
+
+    liquid = None
+    illiquid = None
+
+    if "liquid_assets" in out:
+        liquid = pd.to_numeric(
+            out["liquid_assets"],
+            errors="coerce",
+        )
+
+    if "illiquid_assets" in out:
+        illiquid = pd.to_numeric(
+            out["illiquid_assets"],
+            errors="coerce",
+        )
+
+    if liquid is not None and illiquid is not None:
+        out["total_assets"] = liquid + illiquid
+
+    if liquid is not None and "after_tax_income" in out:
+        after_tax = pd.to_numeric(
+            out["after_tax_income"],
+            errors="coerce",
+        )
+        out["cash_on_hand"] = liquid + after_tax
+
+    if "labor_income_state" in out:
+        permanent_income = pd.to_numeric(
+            out["labor_income_state"],
+            errors="coerce",
+        )
+
+        finite_income = permanent_income.abs()
+        finite_income = finite_income[np.isfinite(finite_income)]
+
+        typical_income = float(finite_income.median()) if len(finite_income) else 1.0
+        income_floor = max(
+            1.0e-6,
+            1.0e-3 * typical_income,
+        )
+        income_scale = permanent_income.abs().clip(
+            lower=income_floor,
+        )
+
+        if liquid is not None:
+            if "param__config__borrowing_limit" in out:
+                borrowing_limit = pd.to_numeric(
+                    out["param__config__borrowing_limit"],
+                    errors="coerce",
+                )
+            elif "liquid_grid_min" in out:
+                borrowing_limit = pd.to_numeric(
+                    out["liquid_grid_min"],
+                    errors="coerce",
+                )
+            else:
+                borrowing_limit = pd.Series(
+                    0.0,
+                    index=out.index,
+                )
+
+            borrowing_limit = borrowing_limit.fillna(0.0)
+            liquid_slack = liquid - borrowing_limit
+
+            out["liquid_slack"] = liquid_slack
+            out["liquid_assets_to_income"] = liquid / income_scale
+            out["liquid_slack_to_income"] = liquid_slack / income_scale
+
+        if illiquid is not None:
+            out["illiquid_assets_to_income"] = illiquid / income_scale
+
     return out
 
 
@@ -402,13 +577,13 @@ def make_policy_slice(
     base: Mapping[str, Any] | pd.Series | None = None,
     n_points: int = 200,
     quantile_range: tuple[str, str] = ("q01", "q99"),
-    linked_income: bool = False,
+    linked_income: bool = True,
 ) -> pd.DataFrame:
     """Evaluate a one-dimensional policy slice.
 
-    When ``linked_income`` is true and ``x='current_income'``, the latent labor-
-    income state moves proportionally with current gross income.  After-tax
-    income is always recomputed by the bundle from the selected tax policy.
+    Pre-tax income is the public income control. When it varies, the latent
+    labor-income state and disposable income move proportionally from the
+    selected baseline state.
     """
 
     if x not in bundle.feature_ranges:
@@ -426,7 +601,14 @@ def make_policy_slice(
         values_array = np.asarray(values, dtype=float)
 
     frame = pd.DataFrame([base_row] * len(values_array))
-    frame[x] = values_array
+
+    # Primitive variables must be assigned before income linking.
+    if x not in DERIVED_ASSET_AXES:
+        frame = set_plot_axis(
+            frame,
+            x,
+            values_array,
+        )
 
     if linked_income and x == "current_income":
         frame = link_labor_income_state(
@@ -434,6 +616,14 @@ def make_policy_slice(
             frame,
             values_array,
             base_row,
+        )
+
+    # Derived ratios must be translated after all income variables are finalized.
+    if x in DERIVED_ASSET_AXES:
+        frame = set_plot_axis(
+            frame,
+            x,
+            values_array,
         )
     frame = complete_derived_state(frame)
     pred = bundle.predict(frame)
@@ -453,13 +643,12 @@ def make_policy_surface(
     base: Mapping[str, Any] | pd.Series | None = None,
     n_x: int = 60,
     n_y: int = 60,
-    linked_income: bool = False,
+    linked_income: bool = True,
 ) -> pd.DataFrame:
     """Evaluate a rectangular two-dimensional policy surface.
 
-    When ``linked_income`` is true, varying ``current_income`` also moves the
-    latent labor-income state in the same proportion as in the base row.  The
-    bundle separately recomputes taxes and after-tax income.
+    Varying pre-tax income also moves the latent labor-income state and
+    disposable income in the same proportion as in the base row.
     """
 
     if x == y:
@@ -484,9 +673,24 @@ def make_policy_surface(
     xv = grid(x, x_values, n_x)
     yv = grid(y, y_values, n_y)
     xx, yy = np.meshgrid(xv, yv)
+
     frame = pd.DataFrame([base_row] * xx.size)
-    frame[x] = xx.ravel()
-    frame[y] = yy.ravel()
+
+    axis_values = {
+        x: xx.ravel(),
+        y: yy.ravel(),
+    }
+
+    # First assign all primitive states and parameters.
+    for variable, values in axis_values.items():
+        if variable not in DERIVED_ASSET_AXES:
+            frame = set_plot_axis(
+                frame,
+                variable,
+                values,
+            )
+
+    # Link latent income after assigning current income.
     if linked_income and "current_income" in {x, y}:
         frame = link_labor_income_state(
             bundle,
@@ -494,7 +698,18 @@ def make_policy_surface(
             frame["current_income"].to_numpy(dtype=float),
             base_row,
         )
+
+    # Translate ratios after income and borrowing-limit values are finalized.
+    for variable, values in axis_values.items():
+        if variable in DERIVED_ASSET_AXES:
+            frame = set_plot_axis(
+                frame,
+                variable,
+                values,
+            )
+
     frame = complete_derived_state(frame)
+
     pred = bundle.predict(frame)
     out = pd.concat(
         [frame.reset_index(drop=True), pred.add_prefix("pred_").reset_index(drop=True)],

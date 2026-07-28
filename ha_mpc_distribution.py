@@ -21,7 +21,7 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from ha_policy_surrogate import PolicySurrogateBundle
+from ha_surrogate_backend import SurrogateBundle
 from ha_policy_visualization import complete_derived_state
 
 EPS = 1.0e-12
@@ -44,7 +44,8 @@ class PopulationAssumptions:
     transitory_income_log_sd: float = 0.20
     high_education_share: float = 0.55
     nonemployment_share: float = 0.08
-    retirement_age: float = 65.0
+    retirement_age: float | None = None
+    working_age_only: bool = True
 
     poor_hand_to_mouth_share: float = 0.25
     wealthy_hand_to_mouth_share: float = 0.15
@@ -64,6 +65,10 @@ class PopulationAssumptions:
             raise ValueError("n_households must be positive.")
         if self.median_income_dollars <= 0:
             raise ValueError("median_income_dollars must be positive.")
+        if self.retirement_age is not None and not np.isfinite(
+            float(self.retirement_age)
+        ):
+            raise ValueError("retirement_age must be finite when supplied.")
         for name in (
             "high_education_share",
             "nonemployment_share",
@@ -74,7 +79,10 @@ class PopulationAssumptions:
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be between zero and one.")
-        if self.poor_hand_to_mouth_share + self.wealthy_hand_to_mouth_share > 1.0 + EPS:
+        if (
+            self.poor_hand_to_mouth_share + self.wealthy_hand_to_mouth_share
+            > 1.0 + EPS
+        ):
             raise ValueError(
                 "poor_hand_to_mouth_share + wealthy_hand_to_mouth_share "
                 "cannot exceed one."
@@ -115,7 +123,7 @@ def _finite_positive_median(values: pd.Series | np.ndarray) -> float | None:
 
 
 def infer_money_unit_info(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     *,
     bundle_path: str | Path | None = None,
     normalized_unit_fallback: float = 53_000.0,
@@ -194,7 +202,9 @@ def infer_money_unit_info(
             except Exception:
                 pass
 
-    if units == "data" or (np.isfinite(income_median_f) and income_median_f > 1_000.0):
+    if units == "data" or (
+        np.isfinite(income_median_f) and income_median_f > 1_000.0
+    ):
         return MoneyUnitInfo("data", 1.0, "income-level heuristic")
     return MoneyUnitInfo(
         "model",
@@ -203,7 +213,7 @@ def infer_money_unit_info(
     )
 
 
-def _range(bundle: PolicySurrogateBundle, column: str) -> tuple[float, float]:
+def _range(bundle: SurrogateBundle, column: str) -> tuple[float, float]:
     info = bundle.feature_ranges.get(column, {})
     lo = float(info.get("q01", info.get("min", -np.inf)))
     hi = float(info.get("q99", info.get("max", np.inf)))
@@ -216,7 +226,7 @@ def _range(bundle: PolicySurrogateBundle, column: str) -> tuple[float, float]:
 
 def _clip_to_training_range(
     values: np.ndarray,
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     column: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     lo, hi = _range(bundle, column)
@@ -232,7 +242,7 @@ def _clip_to_training_range(
     return clipped, changed
 
 
-def _category_values(bundle: PolicySurrogateBundle, column: str) -> list[str]:
+def _category_values(bundle: SurrogateBundle, column: str) -> list[str]:
     info = bundle.feature_ranges.get(column, {})
     return [str(x) for x in info.get("values", [])]
 
@@ -291,7 +301,7 @@ def _education_categories(values: list[str]) -> tuple[str, str]:
 
 
 def generate_synthetic_population(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     *,
     base_values: Mapping[str, Any] | None = None,
     assumptions: PopulationAssumptions = PopulationAssumptions(),
@@ -323,19 +333,45 @@ def generate_synthetic_population(
         low_value, high_value = _education_categories(values)
         frame["education"] = np.where(education_high, high_value, low_value)
 
-    # A flexible lifecycle cross-section supported by the age range in the grids.
+    retirement_age = (
+        float(assumptions.retirement_age)
+        if assumptions.retirement_age is not None
+        else float(
+            base.get(
+                "acct__retirement_age",
+                bundle.accounting_defaults.get("acct__retirement_age", 65.0),
+            )
+        )
+    )
+
+    # A flexible lifecycle cross-section supported by the age range in the
+    # fitted bundle. The solver defines age >= retirement_age as retired, so the
+    # website's working-age population ends at the largest age strictly below
+    # retirement_age.
     if "age" in bundle.feature_spec.state_columns:
         age_lo, age_hi = _range(bundle, "age")
         if not np.isfinite(age_lo):
             age_lo = 25.0
         if not np.isfinite(age_hi) or age_hi <= age_lo:
             age_hi = max(age_lo + 1.0, 82.0)
+        if assumptions.working_age_only:
+            age_hi = min(age_hi, np.nextafter(retirement_age, -np.inf))
+            if age_hi < age_lo:
+                raise ValueError(
+                    "The bundle contains no age support below retirement_age."
+                )
         age = age_lo + (age_hi - age_lo) * rng.beta(2.2, 2.0, n)
         age = np.rint(age)
+        if assumptions.working_age_only:
+            age = np.minimum(age, np.ceil(retirement_age) - 1.0)
     else:
         age = np.repeat(float(base.get("age", 40.0)), n)
+        if assumptions.working_age_only:
+            age = np.minimum(age, np.ceil(retirement_age) - 1.0)
 
-    retired = age >= float(assumptions.retirement_age)
+    retired = age >= retirement_age
+    if assumptions.working_age_only and np.any(retired):
+        raise RuntimeError("Working-age population generation produced retired rows.")
     nonemployed = retired | (rng.random(n) < assumptions.nonemployment_share)
 
     # Permanent and transitory log-income components.  The education loading is
@@ -371,7 +407,8 @@ def generate_synthetic_population(
     poor = draw < assumptions.poor_hand_to_mouth_share
     wealthy_htm = (draw >= assumptions.poor_hand_to_mouth_share) & (
         draw
-        < assumptions.poor_hand_to_mouth_share + assumptions.wealthy_hand_to_mouth_share
+        < assumptions.poor_hand_to_mouth_share
+        + assumptions.wealthy_hand_to_mouth_share
     )
     regular = ~(poor | wealthy_htm)
 
@@ -422,7 +459,7 @@ def generate_synthetic_population(
         "labor_income_state": permanent_income_dollars / divisor,
         "liquid_assets": liquid_assets_dollars / divisor,
         "illiquid_assets": illiquid_assets_dollars / divisor,
-        "years_to_retirement": float(assumptions.retirement_age) - age,
+        "years_to_retirement": retirement_age - age,
         "education_state": education_high.astype(float),
     }
 
@@ -453,15 +490,15 @@ def generate_synthetic_population(
             zero_needles=("not_retired", "working_age", "false"),
             one_needles=("retired", "true"),
         )
-        frame["is_retired"] = np.where(retired, retired_value, not_retired_value)
+        frame["is_retired"] = np.where(
+            retired, retired_value, not_retired_value
+        )
 
     # Other categorical features are held at the selected/base category.
     for column in bundle.feature_spec.categorical_columns:
         if column in frame:
             continue
-        frame[column] = str(
-            base.get(column, bundle.feature_ranges[column].get("mode", "0"))
-        )
+        frame[column] = str(base.get(column, bundle.feature_ranges[column].get("mode", "0")))
 
     # Apply the selected continuous and categorical parameters, then rebuild
     # labor income, pension income, taxes, and after-tax income using the same
@@ -507,9 +544,7 @@ def generate_synthetic_population(
     frame["liquid_assets_dollars_unclipped"] = liquid_assets_dollars
     frame["illiquid_assets_dollars_unclipped"] = illiquid_assets_dollars
     if clipping_flags:
-        frame["state_clipped_to_training_support"] = np.logical_or.reduce(
-            clipping_flags
-        )
+        frame["state_clipped_to_training_support"] = np.logical_or.reduce(clipping_flags)
     else:
         frame["state_clipped_to_training_support"] = False
     frame["household_weight"] = 1.0 / n
@@ -518,7 +553,7 @@ def generate_synthetic_population(
 
 def set_parameter_values(
     frame: pd.DataFrame,
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     values: Mapping[str, Any],
     *,
     recompute_after_tax: bool = True,
@@ -549,6 +584,8 @@ def set_parameter_values(
         else:
             raise KeyError(f"No value available for parameter {column!r}.")
     return bundle.prepare_inputs(out) if recompute_after_tax else out
+
+
 
 
 @dataclass(frozen=True)
@@ -650,9 +687,7 @@ def load_exact_policy_grid(
             policy_layout,
         ).astype(float, copy=False)
         group_values = np.asarray(
-            npz["group_values"]
-            if "group_values" in npz.files
-            else np.arange(consumption.shape[0])
+            npz["group_values"] if "group_values" in npz.files else np.arange(consumption.shape[0])
         )
         ages = np.asarray(
             npz["ages"] if "ages" in npz.files else np.arange(consumption.shape[1]),
@@ -809,11 +844,9 @@ def align_population_to_exact_grid(
 
     education = out.get("education", pd.Series(np.zeros(n), index=out.index))
     g = _group_indices(pd.Series(education), exact_grid.group_values)
-    age_raw = (
-        pd.to_numeric(out["age"], errors="coerce")
-        .fillna(float(np.median(exact_grid.ages)))
-        .to_numpy(dtype=float)
-    )
+    age_raw = pd.to_numeric(out["age"], errors="coerce").fillna(
+        float(np.median(exact_grid.ages))
+    ).to_numpy(dtype=float)
     h = _nearest_indices(exact_grid.ages, age_raw)
 
     employment = out.get(
@@ -824,9 +857,9 @@ def align_population_to_exact_grid(
 
     labor_grid = np.exp(exact_grid.log_income_grid) * factor
     if "labor_income_state" in out:
-        labor_raw = pd.to_numeric(out["labor_income_state"], errors="coerce").to_numpy(
-            dtype=float
-        )
+        labor_raw = pd.to_numeric(
+            out["labor_income_state"], errors="coerce"
+        ).to_numpy(dtype=float)
     elif "current_income" in out:
         labor_raw = pd.to_numeric(out["current_income"], errors="coerce").to_numpy(
             dtype=float
@@ -842,16 +875,12 @@ def align_population_to_exact_grid(
 
     liquid_grid = exact_grid.liquid_grid * factor
     illiquid_grid = exact_grid.illiquid_grid * factor
-    liquid_raw = (
-        pd.to_numeric(out["liquid_assets"], errors="coerce")
-        .fillna(0.0)
-        .to_numpy(dtype=float)
+    liquid_raw = pd.to_numeric(out["liquid_assets"], errors="coerce").fillna(0.0).to_numpy(
+        dtype=float
     )
-    illiquid_raw = (
-        pd.to_numeric(out["illiquid_assets"], errors="coerce")
-        .fillna(float(illiquid_grid[0]))
-        .to_numpy(dtype=float)
-    )
+    illiquid_raw = pd.to_numeric(
+        out["illiquid_assets"], errors="coerce"
+    ).fillna(float(illiquid_grid[0])).to_numpy(dtype=float)
     liquid = np.clip(liquid_raw, liquid_grid[0], liquid_grid[-1])
     illiquid = np.clip(illiquid_raw, illiquid_grid[0], illiquid_grid[-1])
 
@@ -877,16 +906,11 @@ def align_population_to_exact_grid(
     out["exact_exogenous_state_mapped"] = (
         (np.abs(age_raw - exact_grid.ages[h]) > 1.0e-10)
         | (~np.isfinite(labor_raw))
-        | (
-            np.abs(
-                np.where(np.isfinite(labor_raw), labor_raw, out["labor_income_state"])
-                - out["labor_income_state"].to_numpy(dtype=float)
-            )
-            > 1.0e-10
-        )
+        | (np.abs(np.where(np.isfinite(labor_raw), labor_raw, out["labor_income_state"]) - out["labor_income_state"].to_numpy(dtype=float)) > 1.0e-10)
     )
-    out["exact_asset_state_clipped"] = (np.abs(liquid - liquid_raw) > 1.0e-10) | (
-        np.abs(illiquid - illiquid_raw) > 1.0e-10
+    out["exact_asset_state_clipped"] = (
+        (np.abs(liquid - liquid_raw) > 1.0e-10)
+        | (np.abs(illiquid - illiquid_raw) > 1.0e-10)
     )
     return complete_derived_state(out)
 
@@ -923,9 +947,11 @@ def predict_exact_grid_consumption(
     h = aligned_population["exact_state_h"].to_numpy(dtype=np.int64)
     k = aligned_population["exact_state_k"].to_numpy(dtype=np.int64)
     e = aligned_population["exact_state_e"].to_numpy(dtype=np.int64)
-    b_raw = pd.to_numeric(
-        aligned_population["liquid_assets"], errors="coerce"
-    ).to_numpy(dtype=float) + float(liquid_asset_increment)
+    b_raw = (
+        pd.to_numeric(aligned_population["liquid_assets"], errors="coerce")
+        .to_numpy(dtype=float)
+        + float(liquid_asset_increment)
+    )
     a_raw = pd.to_numeric(
         aligned_population["illiquid_assets"], errors="coerce"
     ).to_numpy(dtype=float)
@@ -997,9 +1023,8 @@ def compute_exact_grid_check_mpcs(
     out["baseline_state_clipped"] = baseline_clipped
     return out
 
-
 def compute_check_mpcs(
-    bundle: PolicySurrogateBundle,
+    bundle: SurrogateBundle,
     population: pd.DataFrame,
     *,
     check_amount_dollars: float = 10_000.0,
@@ -1033,9 +1058,9 @@ def compute_check_mpcs(
     # parameters before evaluating either state.
     baseline = bundle.prepare_inputs(population.copy())
     treated = baseline.copy()
-    liquid_before = pd.to_numeric(baseline["liquid_assets"], errors="coerce").to_numpy(
-        dtype=float
-    )
+    liquid_before = pd.to_numeric(
+        baseline["liquid_assets"], errors="coerce"
+    ).to_numpy(dtype=float)
     liquid_after_raw = liquid_before + check_units
     liquid_after = liquid_after_raw.copy()
 
@@ -1143,15 +1168,9 @@ def plot_mpc_distribution(
 
     fig, ax = plt.subplots(figsize=(8.5, 5.5))
     for values, label in zip(arrays, labels):
-        ax.hist(
-            values, bins=edges, density=True, histtype="step", linewidth=2, label=label
-        )
-    ax.axvline(
-        float(np.mean(current)), linestyle="--", linewidth=1.5, label="Current mean"
-    )
-    ax.axvline(
-        float(np.median(current)), linestyle=":", linewidth=1.5, label="Current median"
-    )
+        ax.hist(values, bins=edges, density=True, histtype="step", linewidth=2, label=label)
+    ax.axvline(float(np.mean(current)), linestyle="--", linewidth=1.5, label="Current mean")
+    ax.axvline(float(np.median(current)), linestyle=":", linewidth=1.5, label="Current median")
     ax.set_xlabel("Marginal propensity to consume")
     ax.set_ylabel("Density")
     ax.set_title(title)
