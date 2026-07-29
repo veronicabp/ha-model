@@ -242,9 +242,9 @@ household_mpcs["liquid_to_income"] = household_mpcs[
 # %%
 sns.regplot(
     household_mpcs[
-        (household_mpcs.employment_state == 0)
+        (household_mpcs.employment_state == 1)
         & (household_mpcs.is_retired == 0)
-        & (household_mpcs.liquid_to_income < 1)
+        # & (household_mpcs.liquid_to_income < 1)
     ],
     x="liquid_to_income",
     y="true_mpc",
@@ -253,9 +253,9 @@ sns.regplot(
 )
 sns.regplot(
     household_mpcs[
-        (household_mpcs.employment_state == 0)
+        (household_mpcs.employment_state == 1)
         & (household_mpcs.is_retired == 0)
-        & (household_mpcs.liquid_to_income < 1)
+        # & (household_mpcs.liquid_to_income < 1)
     ],
     x="liquid_to_income",
     y="surrogate_mpc",

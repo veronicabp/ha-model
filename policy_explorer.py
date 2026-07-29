@@ -78,7 +78,7 @@ from ha_mpc_distribution import (
     set_parameter_values,
 )
 
-POLICY_OUTPUTS = [
+LEVEL_POLICY_OUTPUTS = [
     "consumption",
     "deposit",
     "delta_liquid_assets",
@@ -86,7 +86,25 @@ POLICY_OUTPUTS = [
     "next_liquid_assets",
     "next_illiquid_assets",
 ]
-GRID_COMPARISON_OUTPUTS = POLICY_OUTPUTS + ["mpc"]
+
+MARGINAL_RESPONSE_OUTPUTS = [
+    "mpc",
+    "mpd",
+    "liquid_response",
+]
+
+POLICY_OUTPUTS = LEVEL_POLICY_OUTPUTS + MARGINAL_RESPONSE_OUTPUTS
+
+# The exact-grid slice currently implements only the consumption response.
+GRID_COMPARISON_OUTPUTS = LEVEL_POLICY_OUTPUTS + ["mpc"]
+
+DEFAULT_MARGINAL_RESPONSE_CHECK_UNITS = 0.188679
+
+MARGINAL_RESPONSE_DEFAULT_RANGES = {
+    "mpc": (-0.05, 1.05),
+    "mpd": (-1.05, 1.05),
+    "liquid_response": (-1.05, 1.05),
+}
 
 SPECIAL_LABELS = {
     "consumption": "Consumption",
@@ -102,6 +120,8 @@ SPECIAL_LABELS = {
     "illiquid_assets_to_income": "Illiquid Assets / Permanent Income",
     "liquid_slack_to_income": "Liquid Slack / Permanent Income",
     "mpc": "Marginal Propensity to Consume",
+    "mpd": "Marginal Propensity to Deposit in Illiquid Assets",
+    "liquid_response": "Marginal Propensity to Save in Liquid Assets",
 }
 
 
@@ -351,7 +371,7 @@ def _out_of_sample_model_summary(
     bundle: SurrogateBundle,
     catalog: pd.DataFrame,
 ) -> pd.DataFrame:
-    """One row per held-out model with consumption and deposit R²."""
+    """One row per held-out model with consumption, deposit, and MPC R²."""
 
     metrics = bundle.validation_by_model.copy()
 
@@ -381,10 +401,14 @@ def _out_of_sample_model_summary(
         )
     ].copy()
 
-    held_out = held_out[held_out["target"].isin(["consumption", "deposit"])]
+    held_out = held_out[
+        held_out["target"].isin(["consumption", "deposit", "mpc"])
+    ]
 
     if held_out.empty:
-        raise ValueError("No held-out consumption or deposit metrics were found.")
+        raise ValueError(
+            "No held-out consumption, deposit, or MPC metrics were found."
+        )
 
     summary = (
         held_out.pivot_table(
@@ -398,17 +422,18 @@ def _out_of_sample_model_summary(
             columns={
                 "consumption": "consumption_r2",
                 "deposit": "deposit_r2",
+                "mpc": "mpc_r2",
             }
         )
     )
 
-    if "consumption_r2" not in summary:
-        summary["consumption_r2"] = np.nan
+    for column in ("consumption_r2", "deposit_r2", "mpc_r2"):
+        if column not in summary:
+            summary[column] = np.nan
 
-    if "deposit_r2" not in summary:
-        summary["deposit_r2"] = np.nan
-
-    summary["mean_r2"] = summary[["consumption_r2", "deposit_r2"]].mean(axis=1)
+    summary["mean_r2"] = summary[
+        ["consumption_r2", "deposit_r2", "mpc_r2"]
+    ].mean(axis=1)
 
     catalog_small = catalog.copy()
     catalog_small["model_id"] = catalog_small["model_id"].astype(str)
@@ -452,11 +477,11 @@ def _default_output_range(
 
     stored_ranges = stored_ranges or {}
 
-    if output == "mpc" and output not in stored_ranges:
-        lo, hi = -0.05, 1.05
-
-    elif output in stored_ranges:
+    if output in stored_ranges:
         lo, hi = map(float, stored_ranges[output])
+
+    elif output in MARGINAL_RESPONSE_DEFAULT_RANGES:
+        lo, hi = MARGINAL_RESPONSE_DEFAULT_RANGES[output]
 
     elif not sample.empty and output in sample:
         values = pd.to_numeric(sample[output], errors="coerce")
@@ -539,8 +564,8 @@ def _output_axis_slider_bounds(
                 float(next_hi) - float(current["min"]),
             )
         )
-    elif output == "mpc":
-        candidates.append((-0.50, 1.50))
+    elif output in MARGINAL_RESPONSE_OUTPUTS:
+        candidates.append((-2.00, 2.00))
 
     finite = [
         (lo, hi)
@@ -1312,6 +1337,176 @@ def _link_income_states_to_pre_tax_income(
     )
 
 
+
+def _marginal_response_check_control(
+    bundle: SurrogateBundle,
+    *,
+    output: str,
+    context: str,
+) -> float:
+    """Transfer increment used for finite-difference response outcomes."""
+
+    if output not in MARGINAL_RESPONSE_OUTPUTS:
+        return float(DEFAULT_MARGINAL_RESPONSE_CHECK_UNITS)
+
+    units_label = (
+        "model units"
+        if str(bundle.training_metadata.get("money_units", "model")) == "model"
+        else "data units"
+    )
+    check_units = float(
+        st.number_input(
+            f"Transfer used to calculate {_pretty(output)} ({units_label})",
+            min_value=1.0e-6,
+            value=float(DEFAULT_MARGINAL_RESPONSE_CHECK_UNITS),
+            step=0.01,
+            format="%.6f",
+            key=f"{context}__marginal_response_check_units",
+            help=(
+                "The response compares the baseline policy with the policy after "
+                "adding this amount to current liquid assets, holding every "
+                "other primitive state fixed."
+            ),
+        )
+    )
+
+    if output == "liquid_response":
+        st.caption(
+            "The liquid-saving response is the change in Δ liquid assets per "
+            "unit of transfer. The marginal amount retained in next-period "
+            "liquid assets equals one plus this response."
+        )
+    else:
+        st.caption(
+            "The reported outcome is a finite difference with respect to an "
+            "addition to current liquid assets."
+        )
+
+    return check_units
+
+
+def _marginal_response_predictions(
+    bundle: SurrogateBundle,
+    frame: pd.DataFrame,
+    *,
+    check_units: float,
+    baseline_prediction: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Calculate MPC, MPD, and the marginal response of liquid saving.
+
+    For transfer h, the three outcomes are
+
+        MPC = [c(b+h) - c(b)] / h
+        MPD = [d(b+h) - d(b)] / h
+        liquid_response = [Δb(b+h) - Δb(b)] / h.
+
+    The last object is the response of liquid saving, not the response of the
+    next-period liquid-asset level. The latter equals 1 + liquid_response.
+    Rows for which b+h exceeds the represented liquid grid are returned as NaN.
+    """
+
+    h = float(check_units)
+    if not np.isfinite(h) or h <= 0.0:
+        raise ValueError("The marginal-response transfer must be finite and positive.")
+    if "liquid_assets" not in frame:
+        raise KeyError("Marginal responses require liquid_assets.")
+
+    baseline_frame = frame.copy().reset_index(drop=True)
+    baseline = (
+        bundle.predict(baseline_frame)
+        if baseline_prediction is None
+        else baseline_prediction.copy().reset_index(drop=True)
+    )
+
+    required_outputs = {
+        "consumption",
+        "deposit",
+        "delta_liquid_assets",
+    }
+    missing = required_outputs.difference(baseline.columns)
+    if missing:
+        raise KeyError(
+            "Baseline predictions are missing response outputs: "
+            + ", ".join(sorted(missing))
+        )
+
+    current_liquid = pd.to_numeric(
+        baseline_frame["liquid_assets"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    fallback_upper = float(
+        bundle.feature_ranges.get("liquid_assets", {}).get(
+            "max",
+            np.inf,
+        )
+    )
+    if "liquid_grid_max" in baseline_frame:
+        liquid_upper = pd.to_numeric(
+            baseline_frame["liquid_grid_max"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        liquid_upper = np.where(
+            np.isfinite(liquid_upper),
+            liquid_upper,
+            fallback_upper,
+        )
+    else:
+        liquid_upper = np.full(
+            len(baseline_frame),
+            fallback_upper,
+            dtype=float,
+        )
+
+    borrowing_limit = _borrowing_limit_values(
+        baseline_frame,
+        fallback=float(
+            bundle.feature_ranges.get("liquid_assets", {}).get(
+                "min",
+                -np.inf,
+            )
+        ),
+    )
+
+    treated_liquid = current_liquid + h
+    feasible = (
+        np.isfinite(current_liquid)
+        & np.isfinite(treated_liquid)
+        & np.isfinite(borrowing_limit)
+        & (current_liquid >= borrowing_limit - 1.0e-12)
+        & (treated_liquid <= liquid_upper + 1.0e-12)
+    )
+
+    treated_frame = baseline_frame.copy()
+    treated_frame["liquid_assets"] = treated_liquid
+    treated = bundle.predict(treated_frame)
+
+    response = pd.DataFrame(index=baseline_frame.index)
+    response["mpc"] = (
+        pd.to_numeric(treated["consumption"], errors="coerce").to_numpy(dtype=float)
+        - pd.to_numeric(baseline["consumption"], errors="coerce").to_numpy(dtype=float)
+    ) / h
+    response["mpd"] = (
+        pd.to_numeric(treated["deposit"], errors="coerce").to_numpy(dtype=float)
+        - pd.to_numeric(baseline["deposit"], errors="coerce").to_numpy(dtype=float)
+    ) / h
+    response["liquid_response"] = (
+        pd.to_numeric(
+            treated["delta_liquid_assets"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        - pd.to_numeric(
+            baseline["delta_liquid_assets"],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+    ) / h
+
+    for column in MARGINAL_RESPONSE_OUTPUTS:
+        values = pd.to_numeric(response[column], errors="coerce").to_numpy(dtype=float)
+        response[column] = np.where(feasible & np.isfinite(values), values, np.nan)
+
+    return response
+
 def _line_slice(
     bundle: SurrogateBundle,
     base: dict[str, Any],
@@ -1322,6 +1517,7 @@ def _line_slice(
     overlay_values: list[Any],
     outputs: list[str],
     y_range: tuple[float, float],
+    response_check_units: float = DEFAULT_MARGINAL_RESPONSE_CHECK_UNITS,
     n_points: int = 220,
 ) -> go.Figure:
     x_values = np.linspace(float(x_range[0]), float(x_range[1]), n_points)
@@ -1362,6 +1558,16 @@ def _line_slice(
 
         frame = complete_derived_state(frame)
         pred = bundle.predict(frame)
+        response_pred = (
+            _marginal_response_predictions(
+                bundle,
+                frame,
+                check_units=response_check_units,
+                baseline_prediction=pred,
+            )
+            if any(output in MARGINAL_RESPONSE_OUTPUTS for output in outputs)
+            else pd.DataFrame(index=frame.index)
+        )
         liquid = pd.to_numeric(frame["liquid_assets"], errors="coerce").to_numpy(
             dtype=float
         )
@@ -1375,9 +1581,15 @@ def _line_slice(
             & (liquid >= borrowing_limit - 1.0e-12)
         )
         for output in outputs:
-            plotted_values = pd.to_numeric(pred[output], errors="coerce").to_numpy(
-                dtype=float
+            prediction_source = (
+                response_pred
+                if output in MARGINAL_RESPONSE_OUTPUTS
+                else pred
             )
+            plotted_values = pd.to_numeric(
+                prediction_source[output],
+                errors="coerce",
+            ).to_numpy(dtype=float)
             plotted_values = np.where(feasible, plotted_values, np.nan)
             fig.add_trace(
                 go.Scatter(
@@ -1501,6 +1713,12 @@ def _one_dimensional_page(
         st.info("Select at least one overlay value.")
         return
 
+    response_check_units = _marginal_response_check_control(
+        bundle,
+        output=output,
+        context="one_dimensional",
+    )
+
     # Do not load the household-level training sample for ordinary plots.
     # Bundle-level output bounds provide stable axes without a large DataFrame.
     sample = pd.DataFrame()
@@ -1521,6 +1739,7 @@ def _one_dimensional_page(
         overlay_values=overlay_values,
         outputs=[output],
         y_range=y_range,
+        response_check_units=response_check_units,
     )
     st.plotly_chart(fig, width="stretch")
 
@@ -1592,6 +1811,12 @@ def _surface_page(
             key="surface_output",
         )
 
+    response_check_units = _marginal_response_check_control(
+        bundle,
+        output=output,
+        context="two_dimensional",
+    )
+
     xr = _range_selector(bundle, x, "surface_x_range")
     yr = _range_selector(bundle, y, "surface_y_range")
     x_values = np.linspace(xr[0], xr[1], 65)
@@ -1619,6 +1844,28 @@ def _surface_page(
         & (liquid >= borrowing_limit - 1.0e-12)
     )
     value_column = f"pred_{output}"
+    if output in MARGINAL_RESPONSE_OUTPUTS:
+        baseline_prediction = pd.DataFrame(
+            {
+                column: pd.to_numeric(
+                    surface[f"pred_{column}"],
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                for column in (
+                    "consumption",
+                    "deposit",
+                    "delta_liquid_assets",
+                )
+            }
+        )
+        response_prediction = _marginal_response_predictions(
+            bundle,
+            surface,
+            check_units=response_check_units,
+            baseline_prediction=baseline_prediction,
+        )
+        surface[value_column] = response_prediction[output].to_numpy(dtype=float)
+
     surface[value_column] = np.where(
         feasible,
         pd.to_numeric(surface[value_column], errors="coerce").to_numpy(dtype=float),
@@ -2033,17 +2280,44 @@ def _model_base_from_catalog_row(
     base: dict[str, Any],
     selected_row: pd.Series,
 ) -> dict[str, Any]:
-    """Replace sidebar parameters with one solved model's parameter vector."""
+    """Construct a state consistent with one selected solved model.
+
+    The sidebar state is initially prepared using the active website bundle.
+    This function then replaces the structural parameters with the selected
+    held-out model's parameter vector. Because age-profile and employment
+    parameters can change at that step, permanent income must be inferred again
+    from the public pre-tax-income control before the exact-grid slice is built.
+    """
 
     model_base = dict(base)
+
     for column in bundle.feature_spec.parameter_columns:
         if column.endswith("__missing"):
             model_base[column] = 0
         elif column in selected_row.index and pd.notna(selected_row[column]):
             model_base[column] = float(selected_row[column])
+
     for column in bundle.feature_spec.categorical_parameter_columns:
         if column in selected_row.index and pd.notna(selected_row[column]):
             model_base[column] = str(selected_row[column])
+
+    model_frame = pd.DataFrame([model_base])
+    if "current_income" in model_frame:
+        model_frame = _link_income_states_to_pre_tax_income(
+            bundle,
+            model_frame,
+            pd.to_numeric(
+                model_frame["current_income"],
+                errors="coerce",
+            ).to_numpy(dtype=float),
+            base_values=model_base,
+            proportional_after_tax=False,
+        )
+
+    # Recompute taxes, after-tax income, lifecycle variables, and normalized
+    # asset states after the selected model's parameter vector is installed.
+    model_frame = bundle.prepare_inputs(model_frame)
+    model_base.update(model_frame.iloc[0].to_dict())
     return model_base
 
 
@@ -2086,12 +2360,19 @@ def _held_out_model_selector(
         return None
 
     display_summary = model_summary[
-        ["model_id", "consumption_r2", "deposit_r2", "mean_r2"]
+        [
+            "model_id",
+            "consumption_r2",
+            "deposit_r2",
+            "mpc_r2",
+            "mean_r2",
+        ]
     ].rename(
         columns={
             "model_id": "Model",
             "consumption_r2": "Consumption R²",
             "deposit_r2": "Deposit R²",
+            "mpc_r2": "MPC R²",
             "mean_r2": "Mean R²",
         }
     )
@@ -2102,6 +2383,7 @@ def _held_out_model_selector(
         column_config={
             "Consumption R²": st.column_config.NumberColumn(format="%.4f"),
             "Deposit R²": st.column_config.NumberColumn(format="%.4f"),
+            "MPC R²": st.column_config.NumberColumn(format="%.4f"),
             "Mean R²": st.column_config.NumberColumn(format="%.4f"),
         },
     )
@@ -2113,11 +2395,13 @@ def _held_out_model_selector(
         row = summary_lookup.loc[str(model_id)]
         consumption = row["consumption_r2"]
         deposit = row["deposit_r2"]
+        mpc = row["mpc_r2"]
         consumption_text = f"{consumption:.4f}" if pd.notna(consumption) else "NA"
         deposit_text = f"{deposit:.4f}" if pd.notna(deposit) else "NA"
+        mpc_text = f"{mpc:.4f}" if pd.notna(mpc) else "NA"
         return (
             f"{model_id}  |  Consumption R²: {consumption_text}  |  "
-            f"Deposit R²: {deposit_text}"
+            f"Deposit R²: {deposit_text}  |  MPC R²: {mpc_text}"
         )
 
     selected_model_id = st.selectbox(
@@ -2143,7 +2427,7 @@ def _held_out_model_selector(
         st.error(f"The selected model directory does not exist: {model_dir}")
         return None
 
-    metric_columns = st.columns(3)
+    metric_columns = st.columns(4)
     metric_columns[0].metric(
         "Consumption R²",
         (
@@ -2161,6 +2445,14 @@ def _held_out_model_selector(
         ),
     )
     metric_columns[2].metric(
+        "MPC R²",
+        (
+            f"{selected_summary['mpc_r2']:.4f}"
+            if pd.notna(selected_summary["mpc_r2"])
+            else "NA"
+        ),
+    )
+    metric_columns[3].metric(
         "Mean R²",
         (
             f"{selected_summary['mean_r2']:.4f}"
@@ -2264,6 +2556,41 @@ def _exact_grid_comparison_page(
     if exact_all.empty:
         st.warning("The selected exact model has no solved points for this slice.")
         return
+
+    if x != "current_income" and "requested_current_income" in exact_all:
+        requested_income_values = pd.to_numeric(
+            exact_all["requested_current_income"],
+            errors="coerce",
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+        realized_income = pd.to_numeric(
+            exact_all["current_income"],
+            errors="coerce",
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+
+        if len(requested_income_values) and len(realized_income):
+            requested_income = float(requested_income_values.iloc[0])
+            realized_min = float(realized_income.min())
+            realized_max = float(realized_income.max())
+            maximum_gap = float(
+                np.max(
+                    np.abs(
+                        realized_income.to_numpy(dtype=float)
+                        - requested_income
+                    )
+                )
+            )
+            mapping_text = (
+                f"{realized_min:.6g}"
+                if abs(realized_max - realized_min) <= 1.0e-10
+                else f"{realized_min:.6g} to {realized_max:.6g} across the slice"
+            )
+            st.caption(
+                f"Requested fixed Pre-Tax Income: {requested_income:.6g}. "
+                f"Nearest solved income state used: {mapping_text}. "
+                f"Maximum absolute grid gap: {maximum_gap:.6g}. "
+                "The exact model has a discrete income-state grid, so small "
+                "slider movements can remain mapped to the same solved state."
+            )
 
     exact_support = exact_all.copy()
     if output == "mpc":
@@ -2455,20 +2782,49 @@ def _exact_grid_comparison_page(
 
     truth = comparison["exact_grid"].to_numpy(dtype=float)
     predicted = comparison["surrogate"].to_numpy(dtype=float)
-    rmse = float(np.sqrt(np.mean((predicted - truth) ** 2)))
-    max_error = float(np.max(np.abs(predicted - truth)))
-    r2 = (
-        float(
-            1.0 - np.sum((predicted - truth) ** 2) / np.sum((truth - truth.mean()) ** 2)
-        )
-        if len(truth) > 1 and np.var(truth) > 1.0e-14
+    errors = predicted - truth
+
+    rmse = float(np.sqrt(np.mean(errors**2)))
+    max_error = float(np.max(np.abs(errors)))
+    slice_sd = float(np.std(truth))
+    slice_nrmse = (
+        float(rmse / slice_sd)
+        if slice_sd > 1.0e-14
         else np.nan
     )
-    m1, m2, m3, m4 = st.columns(4)
+    r2 = (
+        float(
+            1.0
+            - np.sum(errors**2)
+            / np.sum((truth - truth.mean()) ** 2)
+        )
+        if len(truth) > 1 and slice_sd > 1.0e-14
+        else np.nan
+    )
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Points compared", f"{len(comparison):,}")
-    m2.metric("Slice R²", f"{r2:.4f}" if np.isfinite(r2) else "NA")
-    m3.metric("Slice RMSE", f"{rmse:.6g}")
-    m4.metric("Maximum absolute error", f"{max_error:.6g}")
+    m2.metric("Exact slice SD", f"{slice_sd:.6g}")
+    m3.metric(
+        "Within-slice R²",
+        f"{r2:.4f}" if np.isfinite(r2) else "NA",
+    )
+    m4.metric("Slice RMSE", f"{rmse:.6g}")
+    m5.metric(
+        "RMSE / slice SD",
+        f"{slice_nrmse:.4f}" if np.isfinite(slice_nrmse) else "NA",
+    )
+    m6.metric("Maximum absolute error", f"{max_error:.6g}")
+
+    st.caption(
+        "Within-slice R² is conditional on one held-out model and one "
+        "one-dimensional curve. It uses only variation along this displayed "
+        "slice. The aggregate held-out-test R² pools many household states and "
+        "held-out parameterizations, so it generally has a much larger outcome-"
+        "variance denominator. A nearly flat exact slice can therefore have a "
+        "low or negative within-slice R² despite a small RMSE and high pooled R²."
+    )
+
     with st.expander("Comparison data"):
         st.dataframe(comparison, hide_index=True, width="stretch")
 

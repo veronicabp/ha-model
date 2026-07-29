@@ -470,21 +470,40 @@ def load_exact_grid_slice(
         float(base.get("illiquid_assets", 0.0)),
     )
 
-    if "labor_income_state" in base:
-        k0 = _nearest_grid_index(
-            labor_income_grid[g0],
-            float(base["labor_income_state"]),
+    requested_current_income = float(
+        base.get(
+            "current_income",
+            gross_income_model[g0, h0, K // 2, e0] * factor,
         )
-    else:
-        gross_grid = gross_income_model[g0, h0, :, e0] * factor
-        k0 = _nearest_grid_index(
+    )
+    if not np.isfinite(requested_current_income) or requested_current_income < 0.0:
+        raise ValueError(
+            "The fixed pre-tax income must be finite and nonnegative."
+        )
+
+    def nearest_income_state(age_index: int) -> int:
+        """Nearest solved k state at this age and employment state."""
+
+        gross_grid = gross_income_model[
+            g0,
+            int(age_index),
+            :,
+            e0,
+        ] * factor
+        return _nearest_grid_index(
             gross_grid,
-            float(base.get("current_income", 0.0)),
+            requested_current_income,
         )
 
     if x == "age":
+        # Pre-tax income is the public held-fixed state. As age changes,
+        # persistent income must change so gross income remains as close as
+        # possible to the requested pre-tax-income level.
         h = np.arange(H)
-        k = np.full(H, k0)
+        k = np.asarray(
+            [nearest_income_state(age_index) for age_index in h],
+            dtype=np.int64,
+        )
         b = np.full(H, b0)
         a = np.full(H, a0)
 
@@ -497,13 +516,13 @@ def load_exact_grid_slice(
     elif x in {"liquid_assets", "liquid_slack_to_income"}:
         b = np.arange(B)
         h = np.full(B, h0)
-        k = np.full(B, k0)
+        k = np.full(B, nearest_income_state(h0))
         a = np.full(B, a0)
 
     elif x in {"illiquid_assets", "illiquid_assets_to_income"}:
         a = np.arange(A)
         h = np.full(A, h0)
-        k = np.full(A, k0)
+        k = np.full(A, nearest_income_state(h0))
         b = np.full(A, b0)
 
     else:
@@ -612,6 +631,11 @@ def load_exact_grid_slice(
             "education": np.asarray(group_values)[g],
             "age": ages[h],
             "current_income": gross_income,
+            "requested_current_income": np.repeat(
+                requested_current_income,
+                n,
+            ),
+            "current_income_grid_gap": gross_income - requested_current_income,
             "after_tax_income": after_tax_income,
             "labor_income_state": labor_income_state,
             "employment_state": e,
